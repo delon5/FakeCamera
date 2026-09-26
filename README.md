@@ -9,6 +9,8 @@ Version 1.3 is a single plugin with no special dependency (see [Upgrading from 1
 
 ## Installation
 
+[`release/FakeCamera-1.3.zip`](release/FakeCamera-1.3.zip) holds the plugin and the [ready-made pictures](#ready-made-templates) in memory card layout: copy the content of its `ux0` folder to `ux0:`, then do step 2 below. Otherwise:
+
 1. Copy `fakecamera.suprx` to `ux0:tai/` (or `ur0:tai/` if that is where your plugins live).
 2. In `ux0:tai/config.txt` (or `ur0:tai/config.txt`), add the plugin under the title which needs it:
 
