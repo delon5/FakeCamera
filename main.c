@@ -72,7 +72,18 @@ static float atan2_approx(float y, float x)
 //   invert_y=off       invert the vertical scrolling direction
 //   sensitivity=100    tilt sensitivity in percent (10 to 1000)
 //   log=off            append diagnostics to ux0:data/FakeCamera/log.txt
+//   image=name.bmp     picture for both cameras (in ux0:data/FakeCamera, or a
+//                      full path), tried before the TITLEID/ALL file names
+//   front=name.bmp     picture for the front camera only (overrides "image")
+//   back=name.bmp      picture for the back camera only (overrides "image")
+//
+// The keys before any "*TITLEID" line (or after "*ALL") apply to every title;
+// a "*TITLEID" line starts a section applying to that title only, on top of
+// the global values.
 // ---------------------------------------------------------------------------
+
+#define CONFIG_MAX_SIZE 16384
+#define IMAGE_NAME_MAX  64
 
 typedef struct {
     int motion;
@@ -80,9 +91,13 @@ typedef struct {
     int invertY;
     int sensitivity;
     int log;
+    char image[IMAGE_NAME_MAX];
+    char front[IMAGE_NAME_MAX];
+    char back[IMAGE_NAME_MAX];
 } Config;
 
-static Config config = { 1, 0, 0, 100, 0 };
+static Config config = { 1, 0, 0, 100, 0, "", "", "" };
+static char configText[CONFIG_MAX_SIZE];
 static char titleid[16] = "";
 
 static void Log(const char* fmt, ...)
@@ -135,24 +150,59 @@ static int ParseBool(const char* v)
     return KeyEquals(v, "1") || KeyEquals(v, "on") || KeyEquals(v, "yes") || KeyEquals(v, "true");
 }
 
-static void LoadConfig(void)
+static void CopyName(char* oName, const char* iValue)
 {
-    char buf[1024];
-    SceUID fd = sceIoOpen(CONFIG_PATH, SCE_O_RDONLY, 0);
-    if (fd < 0)
-        return;
-    int len = sceIoRead(fd, buf, sizeof(buf) - 1);
-    sceIoClose(fd);
-    if (len <= 0)
-        return;
-    buf[len] = '\0';
+    strncpy(oName, iValue, IMAGE_NAME_MAX - 1);
+    oName[IMAGE_NAME_MAX - 1] = '\0';
+}
 
-    char* line = buf;
-    while (NULL != line && '\0' != *line)
+static void ApplyConfigValue(const char* key, const char* val)
+{
+    if (KeyEquals(key, "motion"))
+        config.motion = ParseBool(val);
+    else if (KeyEquals(key, "invert_x"))
+        config.invertX = ParseBool(val);
+    else if (KeyEquals(key, "invert_y"))
+        config.invertY = ParseBool(val);
+    else if (KeyEquals(key, "sensitivity"))
     {
-        char* next = strchr(line, '\n');
-        if (NULL != next)
-            *next++ = '\0';
+        int s = atoi(val);
+        if (s >= 10 && s <= 1000)
+            config.sensitivity = s;
+    }
+    else if (KeyEquals(key, "log"))
+        config.log = ParseBool(val);
+    else if (KeyEquals(key, "image"))
+    {
+        // both cameras: a later "front" or "back" line still overrides one of them
+        CopyName(config.image, val);
+        CopyName(config.front, val);
+        CopyName(config.back, val);
+    }
+    else if (KeyEquals(key, "front"))
+        CopyName(config.front, val);
+    else if (KeyEquals(key, "back"))
+        CopyName(config.back, val);
+}
+
+// Applies one section of the configuration text: the global one when
+// iSection is NULL, otherwise the "*iSection" one
+static void ApplyConfigSection(const char* iText, const char* iSection)
+{
+    int inSection = (NULL == iSection);   // the text starts in the global section
+    const char* p = iText;
+    while ('\0' != *p)
+    {
+        const char* end = strchr(p, '\n');
+        size_t len = (NULL != end) ? (size_t)(end - p) : strlen(p);
+        const char* next = p + len + ((NULL != end) ? 1 : 0);
+
+        char line[160];
+        if (len >= sizeof(line))
+            len = sizeof(line) - 1;
+        memcpy(line, p, len);
+        line[len] = '\0';
+        p = next;
 
         char* cut = strchr(line, '#');
         if (NULL != cut)
@@ -161,30 +211,38 @@ static void LoadConfig(void)
         if (NULL != cut)
             *cut = '\0';
 
-        char* eq = strchr(line, '=');
+        char* content = TrimSpaces(line);
+        if ('*' == content[0])
+        {
+            const char* name = TrimSpaces(content + 1);
+            inSection = (NULL == iSection) ? KeyEquals(name, "ALL") : KeyEquals(name, iSection);
+            continue;
+        }
+        if (!inSection)
+            continue;
+
+        char* eq = strchr(content, '=');
         if (NULL != eq)
         {
             *eq = '\0';
-            const char* key = TrimSpaces(line);
-            const char* val = TrimSpaces(eq + 1);
-
-            if (KeyEquals(key, "motion"))
-                config.motion = ParseBool(val);
-            else if (KeyEquals(key, "invert_x"))
-                config.invertX = ParseBool(val);
-            else if (KeyEquals(key, "invert_y"))
-                config.invertY = ParseBool(val);
-            else if (KeyEquals(key, "sensitivity"))
-            {
-                int s = atoi(val);
-                if (s >= 10 && s <= 1000)
-                    config.sensitivity = s;
-            }
-            else if (KeyEquals(key, "log"))
-                config.log = ParseBool(val);
+            ApplyConfigValue(TrimSpaces(content), TrimSpaces(eq + 1));
         }
-        line = next;
     }
+}
+
+static void LoadConfig(void)
+{
+    SceUID fd = sceIoOpen(CONFIG_PATH, SCE_O_RDONLY, 0);
+    if (fd < 0)
+        return;
+    int len = sceIoRead(fd, configText, sizeof(configText) - 1);
+    sceIoClose(fd);
+    if (len <= 0)
+        return;
+    configText[len] = '\0';
+
+    ApplyConfigSection(configText, NULL);      // global values first
+    ApplyConfigSection(configText, titleid);   // then the title's own section
 }
 
 // ---------------------------------------------------------------------------
@@ -803,11 +861,32 @@ static uint64_t prevFrame[NB_CAM] = {0, 0};
 static uint64_t initTimeStamp[NB_CAM] = {0, 0};
 static uint64_t prevTimeStamp[NB_CAM] = {0, 0};
 
-// Looks for an image in this order: TITLEID_Front.bmp (or _Back), TITLEID.bmp,
-// ALL_Front.bmp (or _Back), ALL.bmp
+static void BuildImagePath(char* oPath, size_t iPathSize, const char* iName)
+{
+    if (NULL != strchr(iName, ':'))
+        snprintf(oPath, iPathSize, "%s", iName);           // full path
+    else
+        snprintf(oPath, iPathSize, FAKECAMERA_DIR "/%s", iName);
+}
+
+// Looks for an image in this order: the "front"/"back" then "image" names of
+// the configuration, then TITLEID_Front.bmp (or _Back), TITLEID.bmp,
+// ALL_Front.bmp (or _Back) and ALL.bmp
 static SceUID OpenImageFile(int devnum, char* oPath, size_t iPathSize)
 {
     SceUID fd = -1;
+    const char* configured[2] = { (1 == devnum) ? config.back : config.front, config.image };
+    for (int i = 0; i < 2; i++)
+    {
+        if ('\0' == configured[i][0])
+            continue;
+        BuildImagePath(oPath, iPathSize, configured[i]);
+        fd = sceIoOpen(oPath, SCE_O_RDONLY, 0);
+        if (fd >= 0)
+            return fd;
+        Log("Configured image %s cannot be opened (0x%08X)\n", oPath, fd);
+    }
+
     for (int i = 0; i < 4 && fd < 0; i++)
     {
         switch (i)
@@ -1257,8 +1336,9 @@ int module_start(SceSize argc, const void *args)
     sceAppMgrAppParamGetString(0, 12, titleid, sizeof(titleid));
     titleid[sizeof(titleid) - 1] = '\0';
     LoadConfig();
-    Log("FakeCamera " FAKECAMERA_VERSION " started in %s (motion %s, invert_x %s, invert_y %s, sensitivity %d)\n",
-        titleid, config.motion ? "on" : "off", config.invertX ? "on" : "off", config.invertY ? "on" : "off", config.sensitivity);
+    Log("FakeCamera " FAKECAMERA_VERSION " started in %s (motion %s, invert_x %s, invert_y %s, sensitivity %d, image \"%s\", front \"%s\", back \"%s\")\n",
+        titleid, config.motion ? "on" : "off", config.invertX ? "on" : "off", config.invertY ? "on" : "off", config.sensitivity,
+        config.image, config.front, config.back);
 
     for (unsigned int i = 0; i < NB_HOOKS; i++)
     {

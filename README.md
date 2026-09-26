@@ -64,11 +64,22 @@ When the image is bigger than the camera resolution, the visible part follows th
 Motion is started only when an image is actually loaded; titles which do not get a picture are not affected.
 
 
+## Ready-made templates
+
+The [`templates/`](templates/) directory is a ready-to-copy `ux0:data/FakeCamera/`: pictures drawn for what the camera titles expect (a face for face detection, the six AR Play markers, a room to look around, a colour pattern for stickers and photos...) and a `config.txt` which maps about a hundred title IDs (all regions) of the titles known to use the camera to the right picture. [`templates/README.md`](templates/README.md) explains, title by title, what the camera is used for and what else must be loaded on PS TV. `tools/make_template.py` converts your own photos.
+
+
 ## Configuration (optional)
 
 A `ux0:data/FakeCamera/config.txt` file can tune the plugin. Every line is a `key=value` pair, `#` starts a comment, and the defaults are:
 
 ```
+# Picture for both cameras (image), or for one of them (front, back, which
+# override image): a file in ux0:data/FakeCamera or a full path, tried before
+# the TITLEID/ALL names
+image=
+front=
+back=
 # Tilt scrolling of a large image (on/off)
 motion=on
 # Invert the scrolling direction (on/off), in case it feels reversed with your motion emulator
@@ -80,11 +91,24 @@ sensitivity=100
 log=off
 ```
 
+A `*TITLEID` line starts a section which only applies to that title, on top of the global values (the lines before the first section, or after a `*ALL` line):
+
+```
+front=face.bmp
+back=pattern.bmp
+
+*PCSF00043
+back=objects.bmp
+sensitivity=150
+```
+
+Both cameras, all regions of a title and several titles can thus share one picture, whatever its name; the `TITLEID_Front.bmp` / `TITLEID.bmp` / `ALL.bmp` names of the [Camera image](#camera-image-optional) section remain the fallback.
+
 
 ## Troubleshooting
 
  * **The title still crashes**: check that the plugin line is under the right title identifier (or `*ALL`) and that no other camera plugin is loaded for it.
- * **The picture stays black**: the BMP file is missing, misnamed or unsupported, or the title cannot read `ux0:` (see [ioPlus](#titles-which-cannot-read-ux0)). Set `log=on` in the configuration file and look at `ux0:data/FakeCamera/log.txt`: it tells which file was tried and why it was refused. Writing the log needs the same access as reading the image, so it is empty for sandboxed titles without ioPlus.
+ * **The picture stays black**: the BMP file is missing, misnamed (check the `image=`/`front=`/`back=` lines of the title's section) or unsupported, or the title cannot read `ux0:` (see [ioPlus](#titles-which-cannot-read-ux0)). Set `log=on` in the configuration file and look at `ux0:data/FakeCamera/log.txt`: it tells which file was tried and why it was refused. Writing the log needs the same access as reading the image, so it is empty for sandboxed titles without ioPlus.
  * **The image does not scroll**: no motion source is available (see [Tilt scrolling](#tilt-scrolling)), or the image is not bigger than the camera resolution. The log tells whether `SceMotion` was found and started.
  * **The image scrolls in the wrong direction**: set `invert_x=on` and/or `invert_y=on`.
 

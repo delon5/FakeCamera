@@ -1,0 +1,270 @@
+# FakeCamera 1.3 - ready-made configuration
+#
+# Copy this file and the *.bmp files next to it into ux0:data/FakeCamera/
+# (create the directory). Lines before the first "*TITLEID" line apply to
+# every title; each "*TITLEID" section adds settings for that title only.
+# See templates/README.md for what each title does with the camera.
+
+# Defaults for any title: your face in the front camera, a pattern in the back one
+front=face.bmp
+back=pattern.bmp
+motion=on
+invert_x=off
+invert_y=off
+sensitivity=100
+log=off
+
+# ---- WipEout 2048: pilot picture at a multiplayer session start (small pictures only)
+*PCSF00007
+image=avatar.bmp
+*PCSA00015
+image=avatar.bmp
+*PCSC00006
+image=avatar.bmp
+*PCSD00005
+image=avatar.bmp
+
+# ---- Tearaway: your face in the sun (front), photos used as paper textures (back).
+# Also needs a motion emulator (PSVshell+ "Bt Motion") for the shaking sequences.
+*PCSF00214
+front=face.bmp
+back=pattern.bmp
+*PCSF00476
+front=face.bmp
+back=pattern.bmp
+*PCSA00099
+front=face.bmp
+back=pattern.bmp
+*PCSA00144
+front=face.bmp
+back=pattern.bmp
+*PCSD00072
+front=face.bmp
+back=pattern.bmp
+*PCSD00077
+front=face.bmp
+back=pattern.bmp
+*PCSC00048
+front=face.bmp
+back=pattern.bmp
+*PCSC00064
+front=face.bmp
+back=pattern.bmp
+
+# ---- Frobisher Says!: smile detection (front), "find something of this colour" (back).
+# Needs ioPlus (the title cannot read ux0: by itself).
+*PCSF00043
+front=face.bmp
+back=objects.bmp
+*PCSA00050
+front=face.bmp
+back=objects.bmp
+
+# ---- Welcome Park: "Hello Face" looks for faces, "Snap + Slide" makes a puzzle of the picture
+*NPXS10007
+image=face.bmp
+
+# ---- Virtua Tennis 4 / Power Smash 4: "VT Cam" puts tennis players into the camera picture
+*PCSB00031
+back=arena.bmp
+*PCSB00032
+back=arena.bmp
+*PCSE00003
+back=arena.bmp
+*PCSG00006
+back=arena.bmp
+
+# ---- Reality Fighters: fight backgrounds from the camera, fighters made from your face
+*PCSF00022
+front=face.bmp
+back=arena.bmp
+*PCSA00012
+front=face.bmp
+back=arena.bmp
+*PCSC00011
+front=face.bmp
+back=arena.bmp
+*PCSD00017
+front=face.bmp
+back=arena.bmp
+
+# ---- inviZimals (The Alliance, The Resistance, Hidden Challenges, New Alliance):
+# creatures hidden in your surroundings, captured with the game's own trap card
+# (scan your card and make your own picture with tools/make_template.py)
+*PCSF00164
+back=room.bmp
+*PCSF00448
+back=room.bmp
+*PCSA00137
+back=room.bmp
+*PCSF00510
+back=room.bmp
+*PCSA00552
+back=room.bmp
+*PCSF00235
+back=room.bmp
+*PCSF00415
+back=room.bmp
+*PCSA00122
+back=room.bmp
+*PCSF00533
+back=room.bmp
+
+# ---- AR Play: Fireworks (cards 1 to 3) and Cliff Diving (one card) want a single card
+*PCSA00037
+back=ar-card.bmp
+*PCSF00035
+back=ar-card.bmp
+*PCSC00018
+back=ar-card.bmp
+*PCSA00038
+back=ar-card.bmp
+*PCSF00033
+back=ar-card.bmp
+*PCSC00019
+back=ar-card.bmp
+
+# ---- AR Play: Table Football / Table Soccer (six cards), Table Ice Hockey (three),
+# PulzAR (up to six) and Table Top Tanks (three) want several cards on the table
+*PCSF00062
+back=ar-table.bmp
+*PCSA00035
+back=ar-table.bmp
+*PCSA00064
+back=ar-table.bmp
+*PCSD00047
+back=ar-table.bmp
+*PCSF00145
+back=ar-table.bmp
+*PCSA00036
+back=ar-table.bmp
+*PCSF00036
+back=ar-table.bmp
+*PCSD00044
+back=ar-table.bmp
+*PCSA00048
+back=ar-table.bmp
+*PCSF00030
+back=ar-table.bmp
+*PCSC00022
+back=ar-table.bmp
+*PCSD00046
+back=ar-table.bmp
+
+# ---- Smart As...: AR sums in the air, AR cards in "Alpha Trap", both cameras in "Live Jigsaw"
+*PCSA00079
+front=face.bmp
+back=ar-table.bmp
+*PCSF00217
+front=face.bmp
+back=ar-table.bmp
+*PCSF00020
+front=face.bmp
+back=ar-table.bmp
+*PCSF00216
+front=face.bmp
+back=ar-table.bmp
+
+# ---- Little Deviants: "Botz Invasion" shoots robots flying around your room (tilt to look around)
+*PCSA00010
+back=room.bmp
+*PCSF00017
+back=room.bmp
+*PCSD00009
+back=room.bmp
+
+# ---- LittleBigPlanet PS Vita (and Marvel Super Hero Edition): photo stickers
+*PCSF00021
+image=pattern.bmp
+*PCSA00017
+image=pattern.bmp
+*PCSC00013
+image=pattern.bmp
+*PCSD00006
+image=pattern.bmp
+*PCSF00516
+image=pattern.bmp
+*PCSA00549
+image=pattern.bmp
+
+# ---- Jet Set Radio: pictures imported as graffiti tags
+*PCSE00088
+image=pattern.bmp
+*PCSB00136
+image=pattern.bmp
+*PCSG00104
+image=pattern.bmp
+*PCSH00022
+image=pattern.bmp
+
+# ---- ModNation Racers: Road Trip: photos used as decal templates
+*PCSA00001
+image=pattern.bmp
+*PCSF00002
+image=pattern.bmp
+*PCSD00004
+image=pattern.bmp
+
+# ---- Super Monkey Ball: Banana Splitz: a photo becomes a maze
+*PCSE00017
+back=pattern.bmp
+*PCSB00065
+back=pattern.bmp
+*PCSG00032
+back=pattern.bmp
+
+# ---- Paint Park / Paint Park Plus / New Paint Park: photos to draw on
+*PCSA00059
+image=pattern.bmp
+*PCSF00137
+image=pattern.bmp
+*PCSD00019
+image=pattern.bmp
+*PCSC80007
+image=pattern.bmp
+*PCSC00038
+image=pattern.bmp
+*PCSC00043
+image=pattern.bmp
+*PCSA00111
+image=pattern.bmp
+*PCSF00314
+image=pattern.bmp
+*PCSD00064
+image=pattern.bmp
+
+# ---- Hatsune Miku: Project DIVA f / F 2nd: "AR Live" needs the game's own marker
+# (download it from miku.sega.jp and make a picture of it with tools/make_template.py)
+*PCSG00074
+back=room.bmp
+*PCSE00326
+back=room.bmp
+*PCSB00419
+back=room.bmp
+*PCSG00205
+back=room.bmp
+*PCSE00434
+back=room.bmp
+*PCSB00554
+back=room.bmp
+*PCSH00088
+back=room.bmp
+
+# ---- Uncharted: Golden Abyss: the "hold up to the light" puzzle (reported to solve
+# itself on PS TV; a white picture keeps the camera bright just in case)
+*PCSA00029
+image=white.bmp
+*PCSF00001
+image=white.bmp
+*PCSF00012
+image=white.bmp
+*PCSD00001
+image=white.bmp
+
+# ---- Pro Camera Vita (PlayStation Mobile camera app)
+*PCM300001
+image=pattern.bmp
+
+# ---- VitaShell: QR code scanner (this code opens the FakeCamera page)
+*VITASHELL
+image=qr.bmp
