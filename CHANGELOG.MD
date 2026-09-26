@@ -7,7 +7,8 @@
  * New "templates" directory: pictures drawn for the titles known to use the camera (a face for face detection, the six AR Play markers, a room panorama, a colour pattern, coloured objects, an outdoor backdrop, a QR code...) and a config.txt mapping about a hundred title IDs to them; "tools/make_template.py" converts your own photos
  * BMP reading is more robust: 16 and 32 bits files are decoded through their channel masks (so any layout written by GIMP, Photoshop or Paint works, and the alpha of a 32 bits image is opaque unless the file defines one), top-down files (negative height) are accepted, and malformed, paletted or compressed files are rejected instead of producing garbage
  * Fake answers for sceCameraGet/SetImageQuality, sceCameraGet/SetNoiseReduction and sceCameraGet/SetSharpnessOff
- * Build fixed for the current VitaSDK, and a GitHub Actions workflow builds the plugin on every push
+ * "install.py": installs everything over VitaShell's FTP (plugin, pictures, ioPlus, and the config.txt lines with a backup), or writes the memory card layout for a manual copy. The release zip holds the plugin, the pictures and the installer
+ * Build fixed for the current VitaSDK, and a GitHub Actions workflow builds the plugin and the release zip on every push
 
 ## 1.2.1
 
