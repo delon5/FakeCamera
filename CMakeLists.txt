@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 2.8)
+cmake_minimum_required(VERSION 3.10)
 
 if(NOT DEFINED CMAKE_TOOLCHAIN_FILE)
   if(DEFINED ENV{VITASDK})
@@ -8,12 +8,31 @@ if(NOT DEFINED CMAKE_TOOLCHAIN_FILE)
   endif()
 endif()
 
-project(FakeCamera)
+project(FakeCamera C)
 include("${VITASDK}/share/vita.cmake" REQUIRED)
 
-set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wl,-q -Wall -O3 -std=gnu99")
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++11 -fno-rtti -fno-exceptions")
+set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wl,-q -Wall -Wextra -Wno-unused-parameter -O3 -std=gnu99")
 
-add_subdirectory(FakeCamera)
-add_subdirectory(FakeCameraBMP)
-add_subdirectory(FakeCameraKBMP)
+add_executable(fakecamera
+  main.c
+)
+
+target_link_libraries(fakecamera
+  taihen_stub
+  SceLibKernel_stub
+  SceKernelThreadMgr_stub
+  SceAppMgr_stub
+  SceSysmem_stub
+  SceIofilemgr_stub
+  k
+  gcc
+)
+
+set_target_properties(fakecamera
+  PROPERTIES LINK_FLAGS "-nostdlib"
+)
+
+vita_create_self(fakecamera.suprx fakecamera
+  UNSAFE
+  CONFIG ${CMAKE_SOURCE_DIR}/export.yml
+)

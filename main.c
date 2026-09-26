@@ -1,80 +1,326 @@
+/*
+ * FakeCamera
+ *
+ * taiHEN user plugin that fakes the SceCamera API on devices without a camera
+ * (PlayStation TV, or a PS Vita with a broken camera) so that titles which
+ * expect one keep working, and that can feed a BMP image as the camera picture.
+ *
+ * Copyright (c) OperationNT414C - MIT license, see LICENSE.md
+ */
+
 #include <psp2/kernel/modulemgr.h>
 #include <psp2/kernel/processmgr.h>
 #include <psp2/kernel/threadmgr.h>
-#include <psp2/kernel/clib.h>
-#include <psp2/camera.h>
-#include <taihen.h>
-//#include "log.h"
-
-#ifdef ENABLE_BMP
+#include <psp2/kernel/sysmem.h>
 #include <psp2/io/fcntl.h>
 #include <psp2/appmgr.h>
-#include <psp2/kernel/sysmem.h>
+#include <psp2/camera.h>
+#include <psp2/motion.h>
+#include <taihen.h>
 
-#ifdef READ_WITH_KUIO
-#include <kuio.h>
-#endif
-
-#include <DSMotionLibrary.h>
-
-#include <stdlib.h>
+#include <stdarg.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
-// Structure to simulate SceCamera API alternative behavior
+#define FAKECAMERA_VERSION  "1.3"
+#define FAKECAMERA_DIR      "ux0:data/FakeCamera"
+#define CONFIG_PATH         FAKECAMERA_DIR "/config.txt"
+#define LOG_PATH            FAKECAMERA_DIR "/log.txt"
+
+#define NB_CAM              2       // front and back cameras
+#define MAX_IMAGE_SIZE      2048    // largest accepted BMP width or height (pixels)
+
+// ---------------------------------------------------------------------------
+// Small helpers
+// ---------------------------------------------------------------------------
+
+static inline float absf(float v) { return (v < 0.f) ? -v : v; }
+static inline int absi(int v) { return (v < 0) ? -v : v; }
+static inline float clampf(float v, float lo, float hi) { return (v > hi) ? hi : ((v < lo) ? lo : v); }
+static inline unsigned int minu(unsigned int a, unsigned int b) { return (a < b) ? a : b; }
+
+#define M_PI_F 3.14159265359f
+
+// Fast atan2 approximation (about 0.005 rad of error), enough for tilt control
+static float atan2_approx(float y, float x)
+{
+    const float ONEQTR_PI = M_PI_F / 4.0f;
+    const float THRQTR_PI = 3.0f * M_PI_F / 4.0f;
+    float r, angle;
+    float abs_y = absf(y) + 1e-10f;
+    if (x < 0.0f)
+    {
+        r = (x + abs_y) / (abs_y - x);
+        angle = THRQTR_PI;
+    }
+    else
+    {
+        r = (x - abs_y) / (x + abs_y);
+        angle = ONEQTR_PI;
+    }
+    angle += (0.1963f * r * r - 0.9817f) * r;
+    return (y < 0.0f) ? -angle : angle;
+}
+
+// ---------------------------------------------------------------------------
+// Configuration (optional file: ux0:data/FakeCamera/config.txt)
+//
+//   motion=on          tilt the device (or the DualShock on PS TV) to scroll
+//                      an image larger than the camera resolution
+//   invert_x=off       invert the horizontal scrolling direction
+//   invert_y=off       invert the vertical scrolling direction
+//   sensitivity=100    tilt sensitivity in percent (10 to 1000)
+//   log=off            append diagnostics to ux0:data/FakeCamera/log.txt
+// ---------------------------------------------------------------------------
+
+typedef struct {
+    int motion;
+    int invertX;
+    int invertY;
+    int sensitivity;
+    int log;
+} Config;
+
+static Config config = { 1, 0, 0, 100, 0 };
+static char titleid[16] = "";
+
+static void Log(const char* fmt, ...)
+{
+    if (!config.log)
+        return;
+
+    char line[256];
+    va_list args;
+    va_start(args, fmt);
+    int len = vsnprintf(line, sizeof(line), fmt, args);
+    va_end(args);
+    if (len <= 0)
+        return;
+    if (len >= (int)sizeof(line))
+        len = sizeof(line) - 1;
+
+    SceUID fd = sceIoOpen(LOG_PATH, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_APPEND, 0777);
+    if (fd < 0)
+        return;
+    sceIoWrite(fd, line, len);
+    sceIoClose(fd);
+}
+
+static char* TrimSpaces(char* s)
+{
+    while (' ' == *s || '\t' == *s)
+        s++;
+    char* end = s + strlen(s);
+    while (end > s && (' ' == end[-1] || '\t' == end[-1]))
+        *--end = '\0';
+    return s;
+}
+
+// Case insensitive string equality
+static int KeyEquals(const char* a, const char* b)
+{
+    for (; '\0' != *a && '\0' != *b; a++, b++)
+    {
+        char ca = (*a >= 'A' && *a <= 'Z') ? (char)(*a + 32) : *a;
+        char cb = (*b >= 'A' && *b <= 'Z') ? (char)(*b + 32) : *b;
+        if (ca != cb)
+            return 0;
+    }
+    return *a == *b;
+}
+
+static int ParseBool(const char* v)
+{
+    return KeyEquals(v, "1") || KeyEquals(v, "on") || KeyEquals(v, "yes") || KeyEquals(v, "true");
+}
+
+static void LoadConfig(void)
+{
+    char buf[1024];
+    SceUID fd = sceIoOpen(CONFIG_PATH, SCE_O_RDONLY, 0);
+    if (fd < 0)
+        return;
+    int len = sceIoRead(fd, buf, sizeof(buf) - 1);
+    sceIoClose(fd);
+    if (len <= 0)
+        return;
+    buf[len] = '\0';
+
+    char* line = buf;
+    while (NULL != line && '\0' != *line)
+    {
+        char* next = strchr(line, '\n');
+        if (NULL != next)
+            *next++ = '\0';
+
+        char* cut = strchr(line, '#');
+        if (NULL != cut)
+            *cut = '\0';
+        cut = strchr(line, '\r');
+        if (NULL != cut)
+            *cut = '\0';
+
+        char* eq = strchr(line, '=');
+        if (NULL != eq)
+        {
+            *eq = '\0';
+            const char* key = TrimSpaces(line);
+            const char* val = TrimSpaces(eq + 1);
+
+            if (KeyEquals(key, "motion"))
+                config.motion = ParseBool(val);
+            else if (KeyEquals(key, "invert_x"))
+                config.invertX = ParseBool(val);
+            else if (KeyEquals(key, "invert_y"))
+                config.invertY = ParseBool(val);
+            else if (KeyEquals(key, "sensitivity"))
+            {
+                int s = atoi(val);
+                if (s >= 10 && s <= 1000)
+                    config.sensitivity = s;
+            }
+            else if (KeyEquals(key, "log"))
+                config.log = ParseBool(val);
+        }
+        line = next;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Motion sensors (optional)
+//
+// The image scrolls with the tilt reported by the system SceMotion library.
+// On a PS Vita those are the internal sensors; on a PS TV they are the ones of
+// a DualShock when a motion emulator is running (PSVshell+, ds34motion or
+// DSMotion all feed SceMotion). The library is resolved at run time so that
+// the plugin still loads, without scrolling, when it is not available.
+// ---------------------------------------------------------------------------
+
+#define SCEMOTION_MODULE        "SceDriverUser"
+#define SCEMOTION_LIBRARY_NID   0xDC571B3F
+#define SCEMOTION_START_NID     0x28034AC9  // sceMotionStartSampling
+#define SCEMOTION_STOP_NID      0xAF32CB1D  // sceMotionStopSampling
+#define SCEMOTION_GETSTATE_NID  0xBDB32767  // sceMotionGetState
+
+typedef int (*MotionStartFunc)(void);
+typedef int (*MotionStopFunc)(void);
+typedef int (*MotionGetStateFunc)(SceMotionState* state);
+
+static MotionStartFunc motionStart = NULL;
+static MotionStopFunc motionStop = NULL;
+static MotionGetStateFunc motionGetState = NULL;
+static int motionResolved = 0;      // 0: not tried yet, 1: available, -1: unavailable
+static int motionSampling = 0;      // sampling is currently running
+static int motionStartedByUs = 0;   // this plugin started it, so it stops it on unload
+
+static int ResolveMotion(void)
+{
+    if (0 != motionResolved)
+        return motionResolved > 0;
+
+    uintptr_t fStart = 0, fStop = 0, fGetState = 0;
+    if (taiGetModuleExportFunc(SCEMOTION_MODULE, SCEMOTION_LIBRARY_NID, SCEMOTION_START_NID, &fStart) >= 0
+     && taiGetModuleExportFunc(SCEMOTION_MODULE, SCEMOTION_LIBRARY_NID, SCEMOTION_STOP_NID, &fStop) >= 0
+     && taiGetModuleExportFunc(SCEMOTION_MODULE, SCEMOTION_LIBRARY_NID, SCEMOTION_GETSTATE_NID, &fGetState) >= 0)
+    {
+        motionStart = (MotionStartFunc)fStart;
+        motionStop = (MotionStopFunc)fStop;
+        motionGetState = (MotionGetStateFunc)fGetState;
+        motionResolved = 1;
+    }
+    else
+    {
+        motionResolved = -1;
+    }
+    Log("SceMotion %s\n", (motionResolved > 0) ? "found" : "not found: no image scrolling");
+    return motionResolved > 0;
+}
+
+static void MotionStartSampling(void)
+{
+    if (!config.motion || motionSampling || !ResolveMotion())
+        return;
+
+    int res = motionStart();
+    if (res >= 0)
+    {
+        motionSampling = 1;
+        motionStartedByUs = 1;
+    }
+    else if (SCE_MOTION_ERROR_ALREADY_SAMPLING == (unsigned int)res)
+    {
+        motionSampling = 1;
+    }
+    Log("sceMotionStartSampling: 0x%08X\n", res);
+}
+
+static void MotionStopSampling(void)
+{
+    if (motionSampling && motionStartedByUs && NULL != motionStop)
+        motionStop();
+    motionSampling = 0;
+    motionStartedByUs = 0;
+}
+
+// Fills the scrolling rates (from -1 to 1) and returns 1 when tilt data is
+// available. Without any sensor the image simply stays centered.
+static int MotionGetTilt(float* oWidthRate, float* oHeightRate)
+{
+    *oWidthRate = 0.f;
+    *oHeightRate = 0.f;
+    if (!motionSampling)
+        return 0;
+
+    SceMotionState state;
+    memset(&state, 0, sizeof(state));
+    int res = motionGetState(&state);
+    if (res < 0)
+    {
+        // The title may have stopped the sampling itself: retry at the next camera open
+        if (SCE_MOTION_ERROR_NOT_SAMPLING == (unsigned int)res)
+            motionSampling = 0;
+        return 0;
+    }
+
+    // Gravity as seen by the device: X to the right, Y to the top, Z through the screen
+    float x = state.acceleration.x;
+    float y = state.acceleration.y;
+    float z = state.acceleration.z;
+    if (x*x + y*y + z*z < 0.25f)
+        return 0;   // no sensor data (PS TV without a motion emulator)
+
+    float scale = (float)config.sensitivity / 100.f;
+    float roll = atan2_approx(x, absf(z)) * scale;   // side tilt  -> horizontal scrolling
+    float pitch = atan2_approx(y, absf(z)) * scale;  // front tilt -> vertical scrolling
+    *oWidthRate = clampf(config.invertX ? -roll : roll, -1.f, 1.f);
+    *oHeightRate = clampf(config.invertY ? -pitch : pitch, -1.f, 1.f);
+    return 1;
+}
+
+// ---------------------------------------------------------------------------
+// Camera buffers
+// ---------------------------------------------------------------------------
+
+// Alternative layout of SceCameraRead used by some titles
 typedef struct SceCameraRead2 {
-	SceSize size; //!< sizeof(SceCameraRead2)
-	int mode;
-	int pad;
-	int status;
-	uint64_t frame;
-	uint64_t timestamp;
+    SceSize size;   //!< sizeof(SceCameraRead2)
+    int mode;
+    int pad;
+    int status;
+    uint64_t frame;
+    uint64_t timestamp;
     int unknown0;
     int unknown1;
     int unknown2;
     void* unknownNullCheck;
-	SceSize sizeIBase;
-	SceSize sizeUBase;
-	SceSize sizeVBase;
-	void *pIBase;
-	void *pUBase;
-	void *pVBase;
+    SceSize sizeIBase;
+    SceSize sizeUBase;
+    SceSize sizeVBase;
+    void *pIBase;
+    void *pUBase;
+    void *pVBase;
 } SceCameraRead2;
-
-// Bitmap reading inspired from:
-// https://github.com/xerpi/libvita2d/blob/master/libvita2d/source/vita2d_image_bmp.c
-#define BMP_SIGNATURE (0x4D42)
-
-typedef struct {
-	unsigned short	bfType;
-	unsigned int	bfSize;
-	unsigned short	bfReserved1;
-	unsigned short	bfReserved2;
-	unsigned int	bfOffBits;
-} __attribute__((packed)) BITMAPFILEHEADER;
-
-typedef struct {
-	unsigned int	biSize;
-	int		biWidth;
-	int		biHeight;
-	unsigned short	biPlanes;
-	unsigned short	biBitCount;
-	unsigned int	biCompression;
-	unsigned int	biSizeImage;
-	int		biXPelsPerMeter;
-	int		biYPelsPerMeter;
-	unsigned int	biClrUsed;
-	unsigned int	biClrImportant;
-} __attribute__((packed)) BITMAPINFOHEADER;
-
-unsigned int alignSizeForMemBlock(unsigned int size)
-{
-    if (size & 0xFFF) {
-        // Align to 4kB pages
-        size += ((~size) & 0xFFF) + 1;
-    }
-    return size;
-}
 
 typedef struct {
     SceUID blockIDs[3];
@@ -86,12 +332,40 @@ typedef struct {
     uint16_t heightAlign;
     uint16_t imageWidth;
     uint16_t imageHeight;
-    int ready;
+    int ready;              // -1: no image (or failed to load), 0: loading, 1: ready
 } ImageBuffers;
 
-typedef void (*BufferWriteFunc)(void* iFuncData, ImageBuffers* oBuffers, unsigned int iGlobalPos, uint16_t iWidthPos, uint16_t iHeightPos, unsigned int iColor);
+#define IMAGE_BUFFERS_INIT { {-1, -1, -1}, {NULL, NULL, NULL}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}, 0, 0, 0, 0, -1 }
 
-// Camera formats support
+static unsigned int alignSizeForMemBlock(unsigned int size)
+{
+    if (size & 0xFFF)
+        size += ((~size) & 0xFFF) + 1;  // 4kB pages
+    return size;
+}
+
+static unsigned int bitSize(unsigned int size, unsigned int bits)
+{
+    return (size * bits) / 8;
+}
+
+static void FreeImageBuffers(ImageBuffers* ioBuffers)
+{
+    for (int i = 0; i < 3; i++)
+    {
+        if (ioBuffers->blockIDs[i] >= 0)
+            sceKernelFreeMemBlock(ioBuffers->blockIDs[i]);
+        ioBuffers->blockIDs[i] = -1;
+        ioBuffers->blocksData[i] = NULL;
+    }
+    ioBuffers->ready = -1;
+}
+
+// ---------------------------------------------------------------------------
+// Camera formats: conversion of one ABGR pixel into the camera buffers
+// ---------------------------------------------------------------------------
+
+typedef void (*BufferWriteFunc)(void* iFuncData, ImageBuffers* oBuffers, unsigned int iGlobalPos, uint16_t iWidthPos, uint16_t iHeightPos, unsigned int iColor);
 
 static void ABGRWrite(void* iFuncData, ImageBuffers* oBuffers, unsigned int iGlobalPos, uint16_t iWidthPos, uint16_t iHeightPos, unsigned int iColor)
 {
@@ -103,27 +377,27 @@ static void ARGBWrite(void* iFuncData, ImageBuffers* oBuffers, unsigned int iGlo
     ((unsigned int*)oBuffers->blocksData[0])[iGlobalPos] = (iColor&0xFF00FF00) | (iColor&0xFF)<<16 | (iColor&0xFF0000)>>16;
 }
 
-float convMat[3][3] = { {0.299f, 0.587f, 0.114f}, {-0.14317f, -0.28886f, 0.436f}, {0.615f, -0.51499f, -0.10001f} };
+static const float convMat[3][3] = { {0.299f, 0.587f, 0.114f}, {-0.14317f, -0.28886f, 0.436f}, {0.615f, -0.51499f, -0.10001f} };
 
-typedef struct {
-    unsigned int globalPos;
-    unsigned int colors[2];
-} YUV422Data;
-
-static void RGBToYUV422(YUV422Data* iData, float Y[2], float Cb[2], float Cr[2])
+static void RGBToYUV(const unsigned int* iColors, int iCount, float* Y, float* Cb, float* Cr)
 {
-    for (int i = 0; i < 2; i++)
+    for (int i = 0; i < iCount; i++)
     {
-        unsigned int color = iData->colors[i];
+        unsigned int color = iColors[i];
         float nR = (float)(color&0xFF);
         float nG = (float)((color&0xFF00)>>8);
         float nB = (float)((color&0xFF0000)>>16);
-        
+
         Y[i] = convMat[0][0] * nR + convMat[0][1] * nG + convMat[0][2] * nB;
         Cb[i] = convMat[1][0] * nR + convMat[1][1] * nG + convMat[1][2] * nB + 128.f;
         Cr[i] = convMat[2][0] * nR + convMat[2][1] * nG + convMat[2][2] * nB + 128.f;
     }
 }
+
+typedef struct {
+    unsigned int globalPos;
+    unsigned int colors[2];
+} YUV422Data;
 
 static void YUV422PackedWrite(void* iFuncData, ImageBuffers* oBuffers, unsigned int iGlobalPos, uint16_t iWidthPos, uint16_t iHeightPos, unsigned int iColor)
 {
@@ -135,11 +409,9 @@ static void YUV422PackedWrite(void* iFuncData, ImageBuffers* oBuffers, unsigned 
         return;
     }
     data->colors[1] = iColor;
-    
-    float Y[2];
-    float Cb[2];
-    float Cr[2];
-    RGBToYUV422(data, Y, Cb, Cr);
+
+    float Y[2], Cb[2], Cr[2];
+    RGBToYUV(data->colors, 2, Y, Cb, Cr);
 
     ((unsigned short*)oBuffers->blocksData[0])[data->globalPos] = (((unsigned char)Y[0])<<8) | (unsigned char)((Cb[0]+Cb[1])/2.f);
     ((unsigned short*)oBuffers->blocksData[0])[iGlobalPos] = (((unsigned char)Y[1])<<8) | (unsigned char)((Cr[0]+Cr[1])/2.f);
@@ -155,11 +427,9 @@ static void YUV422PlaneWrite(void* iFuncData, ImageBuffers* oBuffers, unsigned i
         return;
     }
     data->colors[1] = iColor;
-    
-    float Y[2];
-    float Cb[2];
-    float Cr[2];
-    RGBToYUV422(data, Y, Cb, Cr);
+
+    float Y[2], Cb[2], Cr[2];
+    RGBToYUV(data->colors, 2, Y, Cb, Cr);
 
     ((unsigned char*)oBuffers->blocksData[0])[data->globalPos] = (unsigned char)Y[0];
     ((unsigned char*)oBuffers->blocksData[0])[iGlobalPos] = (unsigned char)Y[1];
@@ -172,21 +442,6 @@ typedef struct {
     unsigned int colors[4];
 } YUV420Data;
 
-static void RGBToYUV420(YUV420Data* iData, float Y[4], float Cb[4], float Cr[4])
-{
-    for (int i = 0; i < 4; i++)
-    {
-        unsigned int color = iData->colors[i];
-        float nR = (float)(color&0xFF);
-        float nG = (float)((color&0xFF00)>>8);
-        float nB = (float)((color&0xFF0000)>>16);
-        
-        Y[i] = convMat[0][0] * nR + convMat[0][1] * nG + convMat[0][2] * nB;
-        Cb[i] = convMat[1][0] * nR + convMat[1][1] * nG + convMat[1][2] * nB + 128.f;
-        Cr[i] = convMat[2][0] * nR + convMat[2][1] * nG + convMat[2][2] * nB + 128.f;
-    }
-}
-
 static void YUV420PlaneWrite(void* iFuncData, ImageBuffers* oBuffers, unsigned int iGlobalPos, uint16_t iWidthPos, uint16_t iHeightPos, unsigned int iColor)
 {
     YUV420Data* data = (YUV420Data*)iFuncData;
@@ -196,11 +451,9 @@ static void YUV420PlaneWrite(void* iFuncData, ImageBuffers* oBuffers, unsigned i
     data->colors[pixelPosInBlock] = iColor;
     if (pixelPosInBlock < 3)
         return;
-    
-    float Y[4];
-    float Cb[4];
-    float Cr[4];
-    RGBToYUV420(data, Y, Cb, Cr);
+
+    float Y[4], Cb[4], Cr[4];
+    RGBToYUV(data->colors, 4, Y, Cb, Cr);
 
     ((unsigned short*)oBuffers->blocksData[0])[data->globalPos[0]/2] = (unsigned char)Y[0] | (((unsigned char)Y[1])<<8);
     ((unsigned short*)oBuffers->blocksData[0])[data->globalPos[1]/2] = (unsigned char)Y[2] | (((unsigned char)Y[3])<<8);
@@ -208,35 +461,103 @@ static void YUV420PlaneWrite(void* iFuncData, ImageBuffers* oBuffers, unsigned i
     ((unsigned char*)oBuffers->blocksData[2])[(data->globalPos[1]+(iWidthPos-1))/4] = (unsigned char)((Cr[0]+Cr[1]+Cr[2]+Cr[3])/4.f);
 }
 
-// Bitmap reading functions
+// ---------------------------------------------------------------------------
+// BMP reading (inspired by libvita2d)
+// https://github.com/xerpi/libvita2d/blob/master/libvita2d/source/vita2d_image_bmp.c
+// ---------------------------------------------------------------------------
 
-static unsigned int ReadColor(void* buffer, unsigned short bitCount, unsigned int row_stride, int col, int row)
+#define BMP_SIGNATURE   (0x4D42)
+#define BI_RGB          0
+#define BI_BITFIELDS    3
+
+typedef struct {
+    unsigned short  bfType;
+    unsigned int    bfSize;
+    unsigned short  bfReserved1;
+    unsigned short  bfReserved2;
+    unsigned int    bfOffBits;
+} __attribute__((packed)) BITMAPFILEHEADER;
+
+typedef struct {
+    unsigned int    biSize;
+    int             biWidth;
+    int             biHeight;
+    unsigned short  biPlanes;
+    unsigned short  biBitCount;
+    unsigned int    biCompression;
+    unsigned int    biSizeImage;
+    int             biXPelsPerMeter;
+    int             biYPelsPerMeter;
+    unsigned int    biClrUsed;
+    unsigned int    biClrImportant;
+} __attribute__((packed)) BITMAPINFOHEADER;
+
+// Position of each channel in a 16 or 32 bits pixel
+typedef struct {
+    unsigned int mask;
+    int shift;
+    int bits;
+} ChannelMask;
+
+typedef struct {
+    unsigned short bitCount;
+    ChannelMask r, g, b, a;
+} PixelLayout;
+
+static ChannelMask MakeChannelMask(unsigned int mask)
 {
-    unsigned int imgColor = 0;
-    if (bitCount == 32) {		//BGRA8888
-        unsigned int color = *(unsigned int *)(buffer + row*row_stride + col*4);
-        imgColor = ((color>>24)&0xFF)<<24 | (color&0xFF)<<16 |
-            ((color>>8)&0xFF)<<8 | ((color>>16)&0xFF);
-
-    } else if (bitCount == 24) {	//BGR888
-        unsigned char *address = buffer + row*row_stride + col*3;
-        imgColor = (*address)<<16 | (*(address+1))<<8 |
-            (*(address+2)) | (0xFF<<24);
-
-    } else if (bitCount == 16) {	//BGR565
-        unsigned int color = *(unsigned short *)(buffer + row*row_stride + col*2);
-        unsigned char r = (color       & 0x1F)  *((float)255/31);
-        unsigned char g = ((color>>5)  & 0x3F)  *((float)255/63);
-        unsigned char b = ((color>>11) & 0x1F)  *((float)255/31);
-        imgColor = ((r<<16) | (g<<8) | b | (0xFF<<24));
-    }
-    return imgColor;
+    ChannelMask c = { mask, 0, 0 };
+    if (0 == mask)
+        return c;
+    while (0 == ((mask >> c.shift) & 1))
+        c.shift++;
+    for (unsigned int m = mask >> c.shift; 0 != (m & 1); m >>= 1)
+        c.bits++;
+    return c;
 }
 
-static int LoadBMPGeneric(BITMAPFILEHEADER *bmp_fh, BITMAPINFOHEADER *bmp_ih, SceUID iFile,
-                          ImageBuffers* oBuffers, BufferWriteFunc iWriteFunc, void* iFuncData)
-{    
-    unsigned int row_stride = bmp_ih->biWidth * (bmp_ih->biBitCount/8);
+// Extracts one channel and scales it to 8 bits
+static inline unsigned int ChannelTo8(unsigned int color, const ChannelMask* c)
+{
+    if (0 == c->bits)
+        return 0;
+    unsigned int v = (color & c->mask) >> c->shift;
+    if (c->bits >= 8)
+        return v >> (c->bits - 8);
+    return (v * 255) / ((1u << c->bits) - 1);
+}
+
+// Returns the pixel as ABGR (R in the low byte)
+static unsigned int ReadColor(const void* buffer, const PixelLayout* layout, unsigned int row_stride, int col, int row)
+{
+    const unsigned char* address = (const unsigned char*)buffer + row*row_stride;
+    if (24 == layout->bitCount)     // BGR888
+    {
+        address += col*3;
+        return address[2] | (address[1]<<8) | (address[0]<<16) | (0xFFu<<24);
+    }
+
+    unsigned int color;
+    if (32 == layout->bitCount)
+        color = *(const unsigned int *)(address + col*4);
+    else                            // 16 bits
+        color = *(const unsigned short *)(address + col*2);
+
+    unsigned int r = ChannelTo8(color, &layout->r);
+    unsigned int g = ChannelTo8(color, &layout->g);
+    unsigned int b = ChannelTo8(color, &layout->b);
+    unsigned int a = (0 != layout->a.bits) ? ChannelTo8(color, &layout->a) : 0xFF;
+    return r | (g<<8) | (b<<16) | (a<<24);
+}
+
+// Reads the pixel rows and converts them into the camera buffers. BMP rows are
+// stored bottom-up unless the height is negative (top-down): a top-down file is
+// read backwards so that the converters always see bottom-up rows.
+static int LoadBMPGeneric(const BITMAPFILEHEADER *bmp_fh, const BITMAPINFOHEADER *bmp_ih, const PixelLayout* iLayout,
+                          SceUID iFile, ImageBuffers* oBuffers, BufferWriteFunc iWriteFunc, void* iFuncData)
+{
+    int topDown = (bmp_ih->biHeight < 0);
+    unsigned int row_stride = bmp_ih->biWidth * (iLayout->bitCount/8);
     if (row_stride%4 != 0) {
         row_stride += 4-(row_stride%4);
     }
@@ -245,69 +566,60 @@ static int LoadBMPGeneric(BITMAPFILEHEADER *bmp_fh, BITMAPINFOHEADER *bmp_ih, Sc
     unsigned int size = alignSizeForMemBlock(block_stride);
     SceUID bufferID = sceKernelAllocMemBlock("bitmap_block", SCE_KERNEL_MEMBLOCK_TYPE_USER_RW, size, NULL);
     void *buffer = NULL;
-    sceKernelGetMemBlockBase(bufferID, (void **)&buffer);
-    if (!buffer) {
+    if (bufferID < 0 || sceKernelGetMemBlockBase(bufferID, (void **)&buffer) < 0 || NULL == buffer) {
+        if (bufferID >= 0)
+            sceKernelFreeMemBlock(bufferID);
         return -1;
     }
-
-#ifdef READ_WITH_KUIO
-    kuIoLseek(iFile, bmp_fh->bfOffBits, SCE_SEEK_SET);
-#else
-    sceIoLseek(iFile, bmp_fh->bfOffBits, SCE_SEEK_SET);
-#endif
 
     unsigned int alignedWidth = oBuffers->imageWidth;
     unsigned int alignedHeight = oBuffers->imageHeight;
     unsigned int blocksCount = alignedHeight / oBuffers->heightAlign;
- 
-    int b, i, j, x, y;
-    if (oBuffers->heightAlign > 1)
-    {
-        for (b = 0; b < blocksCount; b++)
-        {
-        #ifdef READ_WITH_KUIO
-            kuIoRead(iFile, buffer, block_stride);
-        #else
-            sceIoRead(iFile, buffer, block_stride);
-        #endif
 
+    sceIoLseek(iFile, bmp_fh->bfOffBits, SCE_SEEK_SET);
+
+    unsigned int b, i, j, x, y;
+    for (b = 0; b < blocksCount; b++)
+    {
+        if (topDown)
+        {
+            unsigned int fileBlock = blocksCount - 1 - b;
+            sceIoLseek(iFile, (SceOff)bmp_fh->bfOffBits + (SceOff)fileBlock * block_stride, SCE_SEEK_SET);
+        }
+        if (sceIoRead(iFile, buffer, block_stride) != (int)block_stride)
+        {
+            sceKernelFreeMemBlock(bufferID);
+            return -1;
+        }
+
+        if (oBuffers->heightAlign > 1)
+        {
             for (i = 0; i < alignedWidth; i+=oBuffers->widthAlign)
             {
                 for (j = 0; j < oBuffers->heightAlign ; j++)
                 {
                     y = b*oBuffers->heightAlign + j;
+                    unsigned int fileRow = topDown ? (oBuffers->heightAlign - 1 - j) : j;
 
                     for (x = i; x < i+oBuffers->widthAlign; x++)
                     {
                         unsigned int globalPos = (alignedHeight - 1 - y)*alignedWidth + x;
-                        unsigned int imgColor = ReadColor(buffer, bmp_ih->biBitCount, row_stride, x, j);
+                        unsigned int imgColor = ReadColor(buffer, iLayout, row_stride, x, fileRow);
                         iWriteFunc(iFuncData, oBuffers, globalPos, x, y, imgColor);
                     }
                 }
             }
         }
-    }
-    else
-    {
-        for (i = 0; i < blocksCount; i++)
+        else
         {
-        #ifdef READ_WITH_KUIO
-            kuIoRead(iFile, buffer, block_stride);
-        #else
-            sceIoRead(iFile, buffer, block_stride);
-        #endif
+            y = b;
+            unsigned int globalPos = (alignedHeight - 1 - y)*alignedWidth;
 
-            for (j = 0; j < oBuffers->heightAlign ; j++)
+            for (x = 0; x < alignedWidth; x++)
             {
-                y = i*oBuffers->heightAlign + j;
-                unsigned int globalPos = (alignedHeight - 1 - y)*alignedWidth;
-
-                for (x = 0; x < alignedWidth; x++)
-                {
-                    unsigned int imgColor = ReadColor(buffer, bmp_ih->biBitCount, row_stride, x, 0);
-                    iWriteFunc(iFuncData, oBuffers, globalPos, x, y, imgColor);
-                    globalPos++;
-                }
+                unsigned int imgColor = ReadColor(buffer, iLayout, row_stride, x, 0);
+                iWriteFunc(iFuncData, oBuffers, globalPos, x, y, imgColor);
+                globalPos++;
             }
         }
     }
@@ -316,29 +628,74 @@ static int LoadBMPGeneric(BITMAPFILEHEADER *bmp_fh, BITMAPINFOHEADER *bmp_ih, Sc
     return 1;
 }
 
-static int LoadBMPFile(SceUID iFile, SceCameraFormat iFormat, char* iMemName, ImageBuffers* oBuffers)
+static int LoadBMPFile(SceUID iFile, SceCameraFormat iFormat, const char* iMemName, ImageBuffers* oBuffers)
 {
     BITMAPFILEHEADER bmp_fh;
-#ifdef READ_WITH_KUIO
-    kuIoRead(iFile, (void *)&bmp_fh, sizeof(BITMAPFILEHEADER));
-#else
-    sceIoRead(iFile, (void *)&bmp_fh, sizeof(BITMAPFILEHEADER));
-#endif
-    if (bmp_fh.bfType != BMP_SIGNATURE)
-        return -1;
-
     BITMAPINFOHEADER bmp_ih;
-#ifdef READ_WITH_KUIO
-    kuIoRead(iFile, (void *)&bmp_ih, sizeof(BITMAPINFOHEADER));
-#else
-    sceIoRead(iFile, (void *)&bmp_ih, sizeof(BITMAPINFOHEADER));
-#endif
+    if (sceIoRead(iFile, (void *)&bmp_fh, sizeof(BITMAPFILEHEADER)) != sizeof(BITMAPFILEHEADER)
+     || sceIoRead(iFile, (void *)&bmp_ih, sizeof(BITMAPINFOHEADER)) != sizeof(BITMAPINFOHEADER))
+    {
+        Log("BMP: file too short\n");
+        return -1;
+    }
+
+    int width = bmp_ih.biWidth;
+    int height = absi(bmp_ih.biHeight);
+    if (bmp_fh.bfType != BMP_SIGNATURE || bmp_ih.biSize < sizeof(BITMAPINFOHEADER)
+     || bmp_fh.bfOffBits < sizeof(BITMAPFILEHEADER) + sizeof(BITMAPINFOHEADER)
+     || width <= 0 || height <= 0 || width > MAX_IMAGE_SIZE || height > MAX_IMAGE_SIZE)
+    {
+        Log("BMP: not a supported bitmap (%dx%d)\n", width, bmp_ih.biHeight);
+        return -1;
+    }
+    if ((bmp_ih.biCompression != BI_RGB && bmp_ih.biCompression != BI_BITFIELDS)
+     || (bmp_ih.biBitCount != 16 && bmp_ih.biBitCount != 24 && bmp_ih.biBitCount != 32)
+     || (bmp_ih.biCompression == BI_BITFIELDS && bmp_ih.biBitCount == 24))
+    {
+        Log("BMP: unsupported %d bits compression %u (use an uncompressed 16, 24 or 32 bits BMP)\n", bmp_ih.biBitCount, bmp_ih.biCompression);
+        return -1;
+    }
+
+    // Channel layout: fixed for BI_RGB, given by masks (following the 40 bytes
+    // header, or embedded in the larger V3/V4/V5 headers) for BI_BITFIELDS
+    PixelLayout layout;
+    unsigned int masks[4] = { 0, 0, 0, 0 };
+    if (BI_BITFIELDS == bmp_ih.biCompression)
+    {
+        int maskBytes = (bmp_ih.biSize >= 56) ? 16 : 12;
+        if (sceIoRead(iFile, masks, maskBytes) != maskBytes)
+        {
+            Log("BMP: file too short\n");
+            return -1;
+        }
+    }
+    else if (16 == bmp_ih.biBitCount)
+    {
+        masks[0] = 0x7C00; masks[1] = 0x03E0; masks[2] = 0x001F;     // X1R5G5B5
+    }
+    else if (32 == bmp_ih.biBitCount)
+    {
+        masks[0] = 0x00FF0000; masks[1] = 0x0000FF00; masks[2] = 0x000000FF; // X8R8G8B8
+    }
+    layout.bitCount = bmp_ih.biBitCount;
+    layout.r = MakeChannelMask(masks[0]);
+    layout.g = MakeChannelMask(masks[1]);
+    layout.b = MakeChannelMask(masks[2]);
+    layout.a = MakeChannelMask(masks[3]);
+    if (24 != layout.bitCount)
+    {
+        unsigned int allowed = (16 == layout.bitCount) ? 0xFFFFu : 0xFFFFFFFFu;
+        if (0 == layout.r.bits || 0 == layout.g.bits || 0 == layout.b.bits
+         || 0 != ((masks[0] | masks[1] | masks[2] | masks[3]) & ~allowed))
+        {
+            Log("BMP: unsupported channel masks %08X %08X %08X %08X\n", masks[0], masks[1], masks[2], masks[3]);
+            return -1;
+        }
+    }
 
     BufferWriteFunc writeFunc = NULL;
     char funcData[24];
-    
-    oBuffers->imageWidth = bmp_ih.biWidth;
-    oBuffers->imageHeight = bmp_ih.biHeight;
+
     oBuffers->rowStride[0] = 0;
     oBuffers->rowStride[1] = 0;
     oBuffers->rowStride[2] = 0;
@@ -380,16 +737,15 @@ static int LoadBMPFile(SceUID iFile, SceCameraFormat iFormat, char* iMemName, Im
         oBuffers->heightAlign = 2;
         writeFunc = &YUV420PlaneWrite;
         break;
-    case SCE_CAMERA_FORMAT_RAW8:
-    case SCE_CAMERA_FORMAT_INVALID:
+    default:
+        Log("BMP: camera format %d is not supported\n", iFormat);
         return -1;
     }
-    
-    if (NULL == writeFunc)
-        return -1;
 
-    oBuffers->imageWidth = (bmp_ih.biWidth/oBuffers->widthAlign)*oBuffers->widthAlign;
-    oBuffers->imageHeight = (bmp_ih.biHeight/oBuffers->heightAlign)*oBuffers->heightAlign;
+    oBuffers->imageWidth = (width/oBuffers->widthAlign)*oBuffers->widthAlign;
+    oBuffers->imageHeight = (height/oBuffers->heightAlign)*oBuffers->heightAlign;
+    if (0 == oBuffers->imageWidth || 0 == oBuffers->imageHeight)
+        return -1;
 
     char memname[48];
     for (int i = 0; i < 3; i++)
@@ -397,99 +753,120 @@ static int LoadBMPFile(SceUID iFile, SceCameraFormat iFormat, char* iMemName, Im
         oBuffers->rowStride[i] = (oBuffers->imageWidth*oBuffers->texelBits[i]*oBuffers->rowDepend[i])/8;
         if (oBuffers->rowStride[i] > 0)
         {
-            sprintf(memname, "%s_%d", iMemName, i);
+            snprintf(memname, sizeof(memname), "%s_%d", iMemName, i);
             unsigned int size = alignSizeForMemBlock(oBuffers->rowStride[i]*oBuffers->imageHeight/oBuffers->rowDepend[i]);
             oBuffers->blockIDs[i] = sceKernelAllocMemBlock(memname, SCE_KERNEL_MEMBLOCK_TYPE_USER_RW, size, NULL);
             oBuffers->blocksData[i] = NULL;
-            sceKernelGetMemBlockBase(oBuffers->blockIDs[i], (void **)&oBuffers->blocksData[i]);
+            if (oBuffers->blockIDs[i] >= 0)
+                sceKernelGetMemBlockBase(oBuffers->blockIDs[i], (void **)&oBuffers->blocksData[i]);
 
-            if (!oBuffers->blocksData[i])
+            if (NULL == oBuffers->blocksData[i])
             {
-                sceKernelFreeMemBlock(oBuffers->blockIDs[i]);
-                oBuffers->blockIDs[i] = -1;
+                Log("BMP: cannot allocate %u bytes for plane %d\n", size, i);
+                FreeImageBuffers(oBuffers);
                 return -1;
             }
         }
     }
-    
-    return LoadBMPGeneric(&bmp_fh, &bmp_ih, iFile, oBuffers, writeFunc, funcData);
+
+    memset(funcData, 0, sizeof(funcData));
+    int res = LoadBMPGeneric(&bmp_fh, &bmp_ih, &layout, iFile, oBuffers, writeFunc, funcData);
+    if (res < 0)
+        FreeImageBuffers(oBuffers);
+    return res;
 }
 
-//#define bitSize(size, bits) ((size*bits)/8)
-unsigned int bitSize(unsigned int size, unsigned int bits)
-{
-    return (size*bits) / 8;
-}
+// ---------------------------------------------------------------------------
+// Camera state
+// ---------------------------------------------------------------------------
 
-// Math functions (used by motion detection)
+static const char* const camName[NB_CAM] = { "Front", "Back" };
 
-#define abs(val) ((val < 0) ? -val : val)
-#define sign(val) ((val > 0) ? 1 : ((val < 0) ? -1 : 0))
-#define clamp(val, min, max) ((val > max) ? max : ((val < min) ? min : val))
-
-#define M_PI 3.14159265359f
-
-float atan2_approx(float y, float x)
-{
-    static float ONEQTR_PI = M_PI / 4.0;
-	static float THRQTR_PI = 3.0 * M_PI / 4.0;
-	float r, angle;
-	float abs_y = abs(y) + 1e-10f;
-	if ( x < 0.0f )
-	{
-		r = (x + abs_y) / (abs_y - x);
-		angle = THRQTR_PI;
-	}
-	else
-	{
-		r = (x - abs_y) / (x + abs_y);
-		angle = ONEQTR_PI;
-	}
-	angle += (0.1963f * r * r - 0.9817f) * r;
-	if ( y < 0.0f )
-		return -angle;
-
-    return angle;
-}
-
-static char titleid[16] = {'\0'};
-
-#endif
-
-
-static SceUID g_hooks[39];
-
-// Open - Close
-
-#define NB_CAM 2
-
-#ifdef ENABLE_BMP
 static uint16_t width[NB_CAM] = {0, 0};
 static uint16_t height[NB_CAM] = {0, 0};
-static SceCameraFormat format[NB_CAM] = {0, 0};
 
 static void* IBufferOnOpen[NB_CAM] = {NULL, NULL};
 static void* UBufferOnOpen[NB_CAM] = {NULL, NULL};
 static void* VBufferOnOpen[NB_CAM] = {NULL, NULL};
 
-static ImageBuffers imageBuffers[NB_CAM] = { { {-1, -1, -1}, {NULL, NULL, NULL}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}, 0, 0, 0, -1} ,
-                                             { {-1, -1, -1}, {NULL, NULL, NULL}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}, 0, 0, 0, -1} };
+static ImageBuffers imageBuffers[NB_CAM] = { IMAGE_BUFFERS_INIT, IMAGE_BUFFERS_INIT };
 static SceCameraFormat imageFormat[NB_CAM] = {0, 0};
 
 static int prevWidthOffset[NB_CAM] = {-1, -1};
 static int prevHeightOffset[NB_CAM] = {-1, -1};
 static void* prevBuffers[NB_CAM][3] = { {NULL, NULL, NULL}, {NULL, NULL, NULL} };
-#endif
 
 static int cameraOpened[NB_CAM] = {0, 0};
-static uint16_t framerate[NB_CAM];
+static int cameraActive[NB_CAM] = {0, 0};
+static uint16_t framerate[NB_CAM] = {0, 0};
 static uint64_t prevFrame[NB_CAM] = {0, 0};
+static uint64_t initTimeStamp[NB_CAM] = {0, 0};
+static uint64_t prevTimeStamp[NB_CAM] = {0, 0};
 
-static tai_hook_ref_t ref_hook0;
+// Looks for an image in this order: TITLEID_Front.bmp (or _Back), TITLEID.bmp,
+// ALL_Front.bmp (or _Back), ALL.bmp
+static SceUID OpenImageFile(int devnum, char* oPath, size_t iPathSize)
+{
+    SceUID fd = -1;
+    for (int i = 0; i < 4 && fd < 0; i++)
+    {
+        switch (i)
+        {
+        case 0: snprintf(oPath, iPathSize, FAKECAMERA_DIR "/%s_%s.bmp", titleid, camName[devnum]); break;
+        case 1: snprintf(oPath, iPathSize, FAKECAMERA_DIR "/%s.bmp", titleid); break;
+        case 2: snprintf(oPath, iPathSize, FAKECAMERA_DIR "/ALL_%s.bmp", camName[devnum]); break;
+        default: snprintf(oPath, iPathSize, FAKECAMERA_DIR "/ALL.bmp"); break;
+        }
+        fd = sceIoOpen(oPath, SCE_O_RDONLY, 0);
+    }
+    return fd;
+}
+
+static void LoadCameraImage(int devnum, SceCameraFormat iFormat)
+{
+    ImageBuffers* imageBuf = &imageBuffers[devnum];
+    if (imageBuf->ready > 0 && imageFormat[devnum] == iFormat)
+        return; // already loaded for this format
+
+    FreeImageBuffers(imageBuf);
+    imageBuf->ready = 0;
+    imageFormat[devnum] = SCE_CAMERA_FORMAT_INVALID;
+
+    char pathname[128];
+    SceUID fd = OpenImageFile(devnum, pathname, sizeof(pathname));
+    if (fd < 0)
+    {
+        Log("No image for %s camera in " FAKECAMERA_DIR " (0x%08X)\n", camName[devnum], fd);
+        imageBuf->ready = -1;
+        return;
+    }
+
+    char memname[32];
+    snprintf(memname, sizeof(memname), "%s_%s", titleid, camName[devnum]);
+    if (LoadBMPFile(fd, iFormat, memname, imageBuf) >= 0)
+    {
+        imageFormat[devnum] = iFormat;
+        imageBuf->ready = 1;
+        Log("Loaded %s (%ux%u) for the %s camera, format %d\n", pathname, imageBuf->imageWidth, imageBuf->imageHeight, camName[devnum], iFormat);
+    }
+    else
+    {
+        imageBuf->ready = -1;
+        Log("Failed to load %s\n", pathname);
+    }
+    sceIoClose(fd);
+}
+
+// ---------------------------------------------------------------------------
+// SceCamera hooks: the real function is always called first, the fake answer
+// is only used when it fails (which means there is no camera)
+// ---------------------------------------------------------------------------
+
+static tai_hook_ref_t ref_sceCameraOpen;
 static int hook_sceCameraOpen(int devnum, SceCameraInfo *pInfo)
 {
-    int res = TAI_CONTINUE(int, ref_hook0, devnum, pInfo);
-    
+    int res = TAI_CONTINUE(int, ref_sceCameraOpen, devnum, pInfo);
+
     if ((unsigned int)devnum < NB_CAM && NULL != pInfo && !cameraOpened[devnum])
     {
         cameraOpened[devnum] = 1;
@@ -517,8 +894,7 @@ static int hook_sceCameraOpen(int devnum, SceCameraInfo *pInfo)
                 pInfo->width = 640;
                 pInfo->height = 360;
             }
-        
-        #ifdef ENABLE_BMP
+
             width[devnum] = pInfo->width;
             height[devnum] = pInfo->height;
             if (0 == pInfo->buffer)
@@ -527,87 +903,11 @@ static int hook_sceCameraOpen(int devnum, SceCameraInfo *pInfo)
                 UBufferOnOpen[devnum] = pInfo->pUBase;
                 VBufferOnOpen[devnum] = pInfo->pVBase;
             }
-            format[devnum] = pInfo->format;
-            
-            //LOG("Camera opened %d with format %d\n", devnum, pInfo->format);
-            //LOG("Buffers pointers %x, %x, %x\n", (unsigned int)pInfo->pIBase, (unsigned int)pInfo->pUBase, (unsigned int)pInfo->pVBase);
-            //log_flush();
 
-            ImageBuffers* imageBuf = &imageBuffers[devnum];
-            if (imageBuf->ready < 0 || imageFormat[devnum] != pInfo->format)
-            {
-                imageBuf->ready = 0;
-                for (int i = 0; i < 3; i++)
-                {
-                    if (imageBuf->blockIDs[i] >= 0 )
-                    {
-                        sceKernelFreeMemBlock(imageBuf->blockIDs[i]);
-                        imageBuf->blockIDs[i] = -1;
-                    }
-                }
-                
-                char memname[32];
-                char pathname[256];
-                char* camname = (1 == devnum)?"Back":"Front";
-                sprintf(memname, "%s_%s", titleid, camname);
-                sprintf(pathname, "ux0:/data/FakeCamera/%s.bmp", memname);
-            #ifdef READ_WITH_KUIO
-                SceUID fd = -1;
-                kuIoOpen(pathname, SCE_O_RDONLY, &fd);
-            #else
-                SceUID fd = sceIoOpen(pathname, SCE_O_RDONLY, 0666);
-            #endif
-                if (fd < 0)
-                {
-                    sprintf(pathname, "ux0:/data/FakeCamera/%s.bmp", titleid);
-                #ifdef READ_WITH_KUIO
-                    kuIoOpen(pathname, SCE_O_RDONLY, &fd);
-                #else
-                    fd = sceIoOpen(pathname, SCE_O_RDONLY, 0666);
-                #endif
-                }
-                if (fd < 0)
-                {
-                    sprintf(pathname, "ux0:/data/FakeCamera/ALL_%s.bmp", camname);
-                #ifdef READ_WITH_KUIO
-                    kuIoOpen(pathname, SCE_O_RDONLY, &fd);
-                #else
-                    fd = sceIoOpen(pathname, SCE_O_RDONLY, 0666);
-                #endif
-                }
-                if (fd < 0)
-                {
-                    sprintf(pathname, "ux0:/data/FakeCamera/ALL.bmp");
-                #ifdef READ_WITH_KUIO
-                    kuIoOpen(pathname, SCE_O_RDONLY, &fd);
-                #else
-                    fd = sceIoOpen(pathname, SCE_O_RDONLY, 0666);
-                #endif
-                }
-                if (fd >= 0)
-                {
-                    //LOG("Try to load file %s\n", pathname);
-                    if (LoadBMPFile(fd, pInfo->format, memname, imageBuf) >= 0)
-                    {
-                        imageFormat[devnum] = pInfo->format;
-                        imageBuf->ready = 1;
-                        //LOG(" => Success\n");
-                    }
-                    else
-                    {
-                        imageFormat[devnum] = SCE_CAMERA_FORMAT_INVALID;
-                        imageBuf->ready = -1;
-                        //LOG(" => Failed\n");
-                    }
-                    //log_flush();
-                #ifdef READ_WITH_KUIO
-                    kuIoClose(fd);
-                #else
-                    sceIoClose(fd);
-                #endif
-                }
-            }
-        #endif
+            Log("Camera %s opened: %ux%u, format %d, framerate %u\n", camName[devnum], pInfo->width, pInfo->height, pInfo->format, pInfo->framerate);
+            LoadCameraImage(devnum, pInfo->format);
+            if (imageBuffers[devnum].ready > 0)
+                MotionStartSampling();  // (re)start the tilt sampling for each opening
 
             res = 0;
         }
@@ -616,41 +916,31 @@ static int hook_sceCameraOpen(int devnum, SceCameraInfo *pInfo)
     return res;
 }
 
-static tai_hook_ref_t ref_hook1;
+static tai_hook_ref_t ref_sceCameraClose;
 static int hook_sceCameraClose(int devnum)
 {
-    int res = TAI_CONTINUE(int, ref_hook1, devnum);
-    
+    int res = TAI_CONTINUE(int, ref_sceCameraClose, devnum);
+
     if ((unsigned int)devnum < NB_CAM)
     {
         cameraOpened[devnum] = 0;
-
-    #ifdef ENABLE_BMP
         width[devnum] = 0;
         height[devnum] = 0;
-        format[devnum] = 0;
         IBufferOnOpen[devnum] = NULL;
         UBufferOnOpen[devnum] = NULL;
         VBufferOnOpen[devnum] = NULL;
-    #endif
 
         if (res < 0) res = 0;
     }
-    
+
     return res;
 }
 
-// Start - Stop
-
-static int cameraActive[NB_CAM] = {0, 0};
-static uint64_t initTimeStamp[NB_CAM];
-static uint64_t prevTimeStamp[NB_CAM];
-
-static tai_hook_ref_t ref_hook2;
+static tai_hook_ref_t ref_sceCameraStart;
 static int hook_sceCameraStart(int devnum)
 {
-    int res = TAI_CONTINUE(int, ref_hook2, devnum);
-    
+    int res = TAI_CONTINUE(int, ref_sceCameraStart, devnum);
+
     if ((unsigned int)devnum < NB_CAM && cameraOpened[devnum])
     {
         cameraActive[devnum] = 1;
@@ -658,47 +948,123 @@ static int hook_sceCameraStart(int devnum)
         prevTimeStamp[devnum] = initTimeStamp[devnum];
         if (res < 0) res = 0;
     }
-    
+
     return res;
 }
 
-static tai_hook_ref_t ref_hook3;
+static tai_hook_ref_t ref_sceCameraStop;
 static int hook_sceCameraStop(int devnum)
 {
-    int res = TAI_CONTINUE(int, ref_hook3, devnum);
-    
+    int res = TAI_CONTINUE(int, ref_sceCameraStop, devnum);
+
     if ((unsigned int)devnum < NB_CAM)
     {
         prevFrame[devnum] = 0;
-    #ifdef ENABLE_BMP
         prevWidthOffset[devnum] = -1;
         prevHeightOffset[devnum] = -1;
         prevBuffers[devnum][0] = NULL;
         prevBuffers[devnum][1] = NULL;
         prevBuffers[devnum][2] = NULL;
-    #endif
 
         cameraActive[devnum] = 0;
         if (res < 0) res = 0;
     }
-    
+
     return res;
 }
 
-// Read
+// Copies the image into the camera buffers, scrolled by the tilt when the
+// image is larger than the camera resolution (centered otherwise)
+static void FillCameraBuffers(int devnum, char* buffers[3], int buffersChanged)
+{
+    ImageBuffers* imageBuf = &imageBuffers[devnum];
 
-static tai_hook_ref_t ref_hook4;
+    float widthOffsetRate = 0.f;
+    float heightOffsetRate = 0.f;
+    MotionGetTilt(&widthOffsetRate, &heightOffsetRate);
+
+    unsigned int imgRowTexels = imageBuf->imageWidth;
+    unsigned int imgRowCount = imageBuf->imageHeight;
+    unsigned int bufRowTexels = width[devnum];
+    unsigned int bufRowCount = height[devnum];
+
+    unsigned int minRowTexels = minu(imgRowTexels, bufRowTexels);
+    unsigned int minRowCount = minu(imgRowCount, bufRowCount);
+
+    int widthLeft = imgRowTexels - bufRowTexels;
+    int heightLeft = imgRowCount - bufRowCount;
+
+    unsigned int widthOffset = (unsigned int)((1.f + widthOffsetRate) * (float)absi(widthLeft) / 2.f);
+    unsigned int heightOffset = (unsigned int)((1.f + heightOffsetRate) * (float)absi(heightLeft) / 2.f);
+    widthOffset = (widthOffset/imageBuf->widthAlign)*imageBuf->widthAlign;
+    heightOffset = (heightOffset/imageBuf->heightAlign)*imageBuf->heightAlign;
+
+    unsigned int bufWidthOffset = 0;
+    unsigned int imgWidthOffset = 0;
+    if (widthLeft > 0)
+        imgWidthOffset = widthOffset;
+    else
+        bufWidthOffset = widthOffset;
+
+    unsigned int bufHeightOffset = 0;
+    unsigned int imgHeightOffset = 0;
+    if (heightLeft > 0)
+        imgHeightOffset = heightOffset;
+    else
+        bufHeightOffset = heightOffset;
+
+    if (prevWidthOffset[devnum] == (int)widthOffset && prevHeightOffset[devnum] == (int)heightOffset && !buffersChanged)
+        return; // the buffers already hold this view
+
+    prevWidthOffset[devnum] = widthOffset;
+    prevHeightOffset[devnum] = heightOffset;
+    prevBuffers[devnum][0] = buffers[0];
+    prevBuffers[devnum][1] = buffers[1];
+    prevBuffers[devnum][2] = buffers[2];
+
+    for (int i = 0; i < 3; i++)
+    {
+        char* image = (imageBuf->blockIDs[i] >= 0) ? imageBuf->blocksData[i] : NULL;
+        if (NULL != buffers[i] && NULL != image)
+        {
+            unsigned int rowDepend = imageBuf->rowDepend[i];
+            unsigned int bufOffset = bufWidthOffset + bufHeightOffset*bufRowTexels/rowDepend;
+            unsigned int imgOffset = imgWidthOffset + imgHeightOffset*imgRowTexels/rowDepend;
+            unsigned int texelDependBits = imageBuf->texelBits[i]*rowDepend;
+
+            for (unsigned int row = 0; row < bufHeightOffset/rowDepend; row++)
+                memset(buffers[i]+bitSize(row*bufRowTexels,texelDependBits), 0, bitSize(bufRowTexels,texelDependBits));
+
+            for (unsigned int row = 0 ; row < minRowCount/rowDepend ; row++)
+                memcpy(buffers[i]+bitSize(row*bufRowTexels+bufOffset,texelDependBits), image+bitSize(row*imgRowTexels+imgOffset,texelDependBits), bitSize(minRowTexels,texelDependBits));
+
+            if (imgRowTexels < bufRowTexels)
+            {
+                for (unsigned int row = bufHeightOffset; row < (bufHeightOffset+minRowCount)/rowDepend ; row++)
+                {
+                    memset(buffers[i]+bitSize(row*bufRowTexels,texelDependBits), 0, bitSize(bufWidthOffset,texelDependBits));
+                    memset(buffers[i]+bitSize(row*bufRowTexels+bufWidthOffset+imgRowTexels,texelDependBits), 0, bitSize(bufRowTexels-bufWidthOffset-imgRowTexels,texelDependBits));
+                }
+            }
+
+            for (unsigned int row = bufHeightOffset+minRowCount; row < bufRowCount/rowDepend; row++)
+                memset(buffers[i]+bitSize(row*bufRowTexels,texelDependBits), 0, bitSize(bufRowTexels,texelDependBits));
+        }
+    }
+}
+
+static tai_hook_ref_t ref_sceCameraRead;
 static int hook_sceCameraRead(int devnum, SceCameraRead *pRead)
 {
-    int res = TAI_CONTINUE(int, ref_hook4, devnum, pRead);
-    
+    int res = TAI_CONTINUE(int, ref_sceCameraRead, devnum, pRead);
+
     if ((unsigned int)devnum < NB_CAM && NULL != pRead && cameraActive[devnum])
-    {        
+    {
         uint64_t newTimeStamp = sceKernelGetProcessTimeWide();
 
         if (res < 0)
         {
-            sceKernelDelayThread(1); // Release current thread time quantum to avoid freeze in some games (Frobisher Says)
+            sceKernelDelayThread(1); // Release the thread time quantum to avoid a freeze in some titles (Frobisher Says)
 
             uint64_t fakeTimeStamp = (newTimeStamp+prevTimeStamp[devnum])>>1;
             uint64_t fakeFrame = (((fakeTimeStamp-initTimeStamp[devnum])*framerate[devnum])>>21) + 1;
@@ -706,7 +1072,7 @@ static int hook_sceCameraRead(int devnum, SceCameraRead *pRead)
             pRead->status = 0;
             if (0 == pRead->mode)
             {
-                // Simulate "wait next frame" time
+                // Simulate the "wait next frame" time
                 while (prevFrame[devnum] >= fakeFrame)
                 {
                     sceKernelDelayThread(1000);
@@ -718,7 +1084,6 @@ static int hook_sceCameraRead(int devnum, SceCameraRead *pRead)
             else if (prevFrame[devnum] >= fakeFrame)
                 pRead->status = 2;
 
-        #ifdef ENABLE_BMP
             ImageBuffers* imageBuf = &imageBuffers[devnum];
 
             char* buffers[3] = {NULL, NULL, NULL};
@@ -735,99 +1100,14 @@ static int hook_sceCameraRead(int devnum, SceCameraRead *pRead)
                 buffers[1] = (NULL != UBufferOnOpen[devnum]) ? UBufferOnOpen[devnum] : pRead->pUBase;
                 buffers[2] = (NULL != VBufferOnOpen[devnum]) ? VBufferOnOpen[devnum] : pRead->pVBase;
             }
-            
-            int buffersTest = (prevBuffers[devnum][0] != buffers[0] || prevBuffers[devnum][1] != buffers[1] || prevBuffers[devnum][2] != buffers[2]);
-            if (imageBuf->ready > 0 && width[devnum] > 0 && height[devnum] > 0 && (prevFrame[devnum] < fakeFrame || buffersTest))
+
+            int buffersChanged = (prevBuffers[devnum][0] != buffers[0] || prevBuffers[devnum][1] != buffers[1] || prevBuffers[devnum][2] != buffers[2]);
+            if (imageBuf->ready > 0 && width[devnum] > 0 && height[devnum] > 0 && (prevFrame[devnum] < fakeFrame || buffersChanged))
             {
                 prevFrame[devnum] = fakeFrame;
-
-                float widthOffsetRate = 0.f;
-                float heightOffsetRate = 0.f;
-
-                signed short accel[3];
-                signed short gyro[3];
-                if (dsGetSampledAccelGyro(100, accel, gyro) >= 0)
-                {
-                    SceFVector3 accelVec = {-(float)accel[2] / 0x2000, (float)accel[0] / 0x2000, -(float)accel[1] / 0x2000};
-                    
-                    float pitch = atan2_approx(accelVec.z, -accelVec.y);
-                    float roll = atan2_approx(-accelVec.x, -accelVec.z*sign(-pitch));
-
-                    widthOffsetRate = clamp(-roll, -1.f, 1.f);
-                    heightOffsetRate = clamp(-(pitch+M_PI/2.f), -1.f, 1.f);
-                }
-                
-                unsigned int imgRowTexels = imageBuf->imageWidth;
-                unsigned int imgRowCount = imageBuf->imageHeight;
-                unsigned int bufRowTexels = width[devnum];
-                unsigned int bufRowCount = height[devnum];
-
-                unsigned int minRowTexels = (imgRowTexels < bufRowTexels) ? imgRowTexels : bufRowTexels;
-                unsigned int minRowCount = (imgRowCount < bufRowCount) ? imgRowCount : bufRowCount;
-
-                int widthLeft = imgRowTexels - bufRowTexels;
-                int heightLeft = imgRowCount - bufRowCount;
-
-                unsigned int widthOffset = (unsigned int)((1.f + widthOffsetRate) * (float)abs(widthLeft) / 2.f);
-                unsigned int heightOffset = (unsigned int)((1.f + heightOffsetRate) * (float)abs(heightLeft) / 2.f);
-                widthOffset = (widthOffset/imageBuf->widthAlign)*imageBuf->widthAlign;
-                heightOffset = (heightOffset/imageBuf->heightAlign)*imageBuf->heightAlign;
-                
-                unsigned int bufWidthOffset = 0;
-                unsigned int imgWidthOffset = 0;
-                if (widthLeft > 0)
-                    imgWidthOffset = widthOffset;
-                else
-                    bufWidthOffset = widthOffset;
-
-                unsigned int bufHeightOffset = 0;
-                unsigned int imgHeightOffset = 0;
-                if (heightLeft > 0)
-                    imgHeightOffset = heightOffset;
-                else
-                    bufHeightOffset = heightOffset;
-
-                if (prevWidthOffset[devnum] != widthOffset || prevHeightOffset[devnum] != heightOffset || buffersTest)
-                {
-                    prevWidthOffset[devnum] = widthOffset;
-                    prevHeightOffset[devnum] = heightOffset;
-                    prevBuffers[devnum][0] = buffers[0];
-                    prevBuffers[devnum][1] = buffers[1];
-                    prevBuffers[devnum][2] = buffers[2];
-
-                    for (int i = 0; i < 3; i++)
-                    {
-                        char* image = (imageBuf->blockIDs[i] >= 0) ? imageBuf->blocksData[i] : NULL;
-                        if (NULL != buffers[i] && NULL != image)
-                        {
-                            unsigned int rowDepend = imageBuf->rowDepend[i];
-                            unsigned int bufOffset = bufWidthOffset + bufHeightOffset*bufRowTexels/rowDepend;
-                            unsigned int imgOffset = imgWidthOffset + imgHeightOffset*imgRowTexels/rowDepend;
-                            unsigned int texelDependBits = imageBuf->texelBits[i]*rowDepend;
-
-                            for (int row = 0; row < bufHeightOffset/rowDepend; row++)
-                                memset(buffers[i]+bitSize(row*bufRowTexels,texelDependBits), 0, bitSize(bufRowTexels,texelDependBits));
-
-                            for (int row = 0 ; row < minRowCount/rowDepend ; row++)
-                                memcpy(buffers[i]+bitSize(row*bufRowTexels+bufOffset,texelDependBits), image+bitSize(row*imgRowTexels+imgOffset,texelDependBits), bitSize(minRowTexels,texelDependBits));
-                            
-                            if (imgRowTexels < bufRowTexels)
-                            {
-                                for (int row = bufHeightOffset; row < (bufHeightOffset+minRowCount)/rowDepend ; row++)
-                                {
-                                    memset(buffers[i]+bitSize(row*bufRowTexels,texelDependBits), 0, bitSize(bufWidthOffset,texelDependBits));
-                                    memset(buffers[i]+bitSize(row*bufRowTexels+bufWidthOffset+imgRowTexels,texelDependBits), 0, bitSize(bufRowTexels-bufWidthOffset-imgRowTexels,texelDependBits));
-                                }
-                            }
-
-                            for (int row = bufHeightOffset+minRowCount; row < bufRowCount/rowDepend; row++)
-                                memset(buffers[i]+bitSize(row*bufRowTexels,texelDependBits), 0, bitSize(bufRowTexels,texelDependBits));
-                        }
-                    }
-                }
+                FillCameraBuffers(devnum, buffers, buffersChanged);
             }
-        #endif
-            
+
             pRead->frame = fakeFrame;
             pRead->timestamp = fakeTimeStamp;
             res = 0;
@@ -839,729 +1119,169 @@ static int hook_sceCameraRead(int devnum, SceCameraRead *pRead)
     return res;
 }
 
-// Active
-
-static tai_hook_ref_t ref_hook5;
+static tai_hook_ref_t ref_sceCameraIsActive;
 static int hook_sceCameraIsActive(int devnum)
 {
-    int res = TAI_CONTINUE(int, ref_hook5, devnum);
+    int res = TAI_CONTINUE(int, ref_sceCameraIsActive, devnum);
     if ((unsigned int)devnum < NB_CAM && res <= 0) res = cameraActive[devnum];
     return res;
 }
 
-// Location
-
-static tai_hook_ref_t ref_hook6;
+static tai_hook_ref_t ref_sceCameraGetDeviceLocation;
 static int hook_sceCameraGetDeviceLocation(int devnum, SceFVector3 *pLocation)
 {
-    int res = TAI_CONTINUE(int, ref_hook6, devnum, pLocation);
+    int res = TAI_CONTINUE(int, ref_sceCameraGetDeviceLocation, devnum, pLocation);
     if ((unsigned int)devnum < NB_CAM && NULL != pLocation && res < 0) res = 0;
     return res;
 }
 
-// Saturation
-
-static int saturation[NB_CAM] = {SCE_CAMERA_SATURATION_0, SCE_CAMERA_SATURATION_0};
-
-static tai_hook_ref_t ref_hook7;
-static int hook_sceCameraGetSaturation(int devnum, int *pLevel)
-{
-    int res = TAI_CONTINUE(int, ref_hook7, devnum, pLevel);
-    if ((unsigned int)devnum < NB_CAM && NULL != pLevel && res < 0)
-    {
-        *pLevel = saturation[devnum];
-        res = 0;
-    }
-    return res;
+// Every remaining camera setting is a pair of "get"/"set" functions working on
+// an integer: the value set by the title is remembered and given back to it.
+#define CAMERA_INT_SETTING(Name, defaultValue)                                     \
+static int setting##Name[NB_CAM] = {defaultValue, defaultValue};                    \
+static tai_hook_ref_t ref_sceCameraGet##Name;                                       \
+static int hook_sceCameraGet##Name(int devnum, int *pValue)                         \
+{                                                                                   \
+    int res = TAI_CONTINUE(int, ref_sceCameraGet##Name, devnum, pValue);            \
+    if ((unsigned int)devnum < NB_CAM && NULL != pValue && res < 0)                 \
+    {                                                                               \
+        *pValue = setting##Name[devnum];                                            \
+        res = 0;                                                                    \
+    }                                                                               \
+    return res;                                                                     \
+}                                                                                   \
+static tai_hook_ref_t ref_sceCameraSet##Name;                                       \
+static int hook_sceCameraSet##Name(int devnum, int value)                           \
+{                                                                                   \
+    int res = TAI_CONTINUE(int, ref_sceCameraSet##Name, devnum, value);             \
+    if ((unsigned int)devnum < NB_CAM && res < 0)                                   \
+    {                                                                               \
+        setting##Name[devnum] = value;                                              \
+        res = 0;                                                                    \
+    }                                                                               \
+    return res;                                                                     \
 }
 
-static tai_hook_ref_t ref_hook8;
-static int hook_sceCameraSetSaturation(int devnum, int level)
-{
-    int res = TAI_CONTINUE(int, ref_hook8, devnum, level);
-    if ((unsigned int)devnum < NB_CAM && res < 0)
-    {
-        saturation[devnum] = level;
-        res = 0;
-    }
-    return res;
-}
+CAMERA_INT_SETTING(Saturation, SCE_CAMERA_SATURATION_0)
+CAMERA_INT_SETTING(Brightness, 127)
+CAMERA_INT_SETTING(Contrast, 127)
+CAMERA_INT_SETTING(Sharpness, SCE_CAMERA_SHARPNESS_100)
+CAMERA_INT_SETTING(Reverse, SCE_CAMERA_REVERSE_OFF)
+CAMERA_INT_SETTING(Effect, SCE_CAMERA_EFFECT_NORMAL)
+CAMERA_INT_SETTING(EV, SCE_CAMERA_EV_POSITIVE_0)
+CAMERA_INT_SETTING(Zoom, 10)
+CAMERA_INT_SETTING(AntiFlicker, SCE_CAMERA_ANTIFLICKER_AUTO)
+CAMERA_INT_SETTING(ISO, SCE_CAMERA_ISO_AUTO)
+CAMERA_INT_SETTING(Gain, SCE_CAMERA_GAIN_AUTO)
+CAMERA_INT_SETTING(WhiteBalance, SCE_CAMERA_WB_AUTO)
+CAMERA_INT_SETTING(Backlight, SCE_CAMERA_BACKLIGHT_OFF)
+CAMERA_INT_SETTING(Nightmode, SCE_CAMERA_NIGHTMODE_OFF)
+CAMERA_INT_SETTING(ExposureCeiling, 0)
+CAMERA_INT_SETTING(AutoControlHold, 0)
+CAMERA_INT_SETTING(ImageQuality, 0)
+CAMERA_INT_SETTING(NoiseReduction, 0)
+CAMERA_INT_SETTING(SharpnessOff, 0)
 
-// Brightness
+// ---------------------------------------------------------------------------
+// Module
+// ---------------------------------------------------------------------------
 
-static int brightness[NB_CAM] = {127, 127};
+#define SCECAMERA_LIBRARY_NID 0xDA91B3ED
 
-static tai_hook_ref_t ref_hook9;
-static int hook_sceCameraGetBrightness(int devnum, int *pLevel)
-{
-    int res = TAI_CONTINUE(int, ref_hook9, devnum, pLevel);
-    if ((unsigned int)devnum < NB_CAM && NULL != pLevel && res < 0)
-    {
-        *pLevel = brightness[devnum];
-        res = 0;
-    }
-    return res;
-}
+typedef struct {
+    uint32_t nid;
+    const void* func;
+    tai_hook_ref_t* ref;
+} HookEntry;
 
-static tai_hook_ref_t ref_hook10;
-static int hook_sceCameraSetBrightness(int devnum, int level)
-{
-    int res = TAI_CONTINUE(int, ref_hook10, devnum, level);
-    if ((unsigned int)devnum < NB_CAM && res < 0)
-    {
-        brightness[devnum] = level;
-        res = 0;
-    }
-    return res;
-}
+#define HOOK(nid, name) { nid, hook_##name, &ref_##name }
 
-// Contrast
+static const HookEntry hookTable[] = {
+    HOOK(0xA462F801, sceCameraOpen),
+    HOOK(0xCD6E1CFC, sceCameraClose),
+    HOOK(0xA8FEAE35, sceCameraStart),
+    HOOK(0x1DD9C9CE, sceCameraStop),
+    HOOK(0x79B5C2DE, sceCameraRead),
+    HOOK(0x103A75B8, sceCameraIsActive),
+    HOOK(0x274EF751, sceCameraGetDeviceLocation),
+    HOOK(0x624F7653, sceCameraGetSaturation),
+    HOOK(0xF9F7CA3D, sceCameraSetSaturation),
+    HOOK(0x85D5951D, sceCameraGetBrightness),
+    HOOK(0x98D71588, sceCameraSetBrightness),
+    HOOK(0x8FBE84BE, sceCameraGetContrast),
+    HOOK(0x06FB2900, sceCameraSetContrast),
+    HOOK(0xAA72C3DC, sceCameraGetSharpness),
+    HOOK(0xD1A5BB0B, sceCameraSetSharpness),
+    HOOK(0x44F6043F, sceCameraGetReverse),
+    HOOK(0x1175F477, sceCameraSetReverse),
+    HOOK(0x7E8EF3B2, sceCameraGetEffect),
+    HOOK(0xE9D2CFB1, sceCameraSetEffect),
+    HOOK(0x8B5E6147, sceCameraGetEV),
+    HOOK(0x62AFF0B8, sceCameraSetEV),
+    HOOK(0x06D3816C, sceCameraGetZoom),
+    HOOK(0xF7464216, sceCameraSetZoom),
+    HOOK(0x9FDACB99, sceCameraGetAntiFlicker),
+    HOOK(0xE312958A, sceCameraSetAntiFlicker),
+    HOOK(0x4EBD5C68, sceCameraGetISO),
+    HOOK(0x3CF630A1, sceCameraSetISO),
+    HOOK(0x2C36D6F3, sceCameraGetGain),
+    HOOK(0xE65CFE86, sceCameraSetGain),
+    HOOK(0xDBFFA1DA, sceCameraGetWhiteBalance),
+    HOOK(0x4D4514AC, sceCameraSetWhiteBalance),
+    HOOK(0x8DD1292B, sceCameraGetBacklight),
+    HOOK(0xAE071044, sceCameraSetBacklight),
+    HOOK(0x12B6FF26, sceCameraGetNightmode),
+    HOOK(0x3F26233E, sceCameraSetNightmode),
+    HOOK(0x5FA5B1BB, sceCameraGetExposureCeiling),
+    HOOK(0x04F34BEE, sceCameraSetExposureCeiling),
+    HOOK(0x06A21BBB, sceCameraGetAutoControlHold),
+    HOOK(0x3A0DABBD, sceCameraSetAutoControlHold),
+    HOOK(0xE2AC7BCE, sceCameraGetImageQuality),
+    HOOK(0x75C4300B, sceCameraSetImageQuality),
+    HOOK(0xFEB99ACC, sceCameraGetNoiseReduction),
+    HOOK(0xF9B79556, sceCameraSetNoiseReduction),
+    HOOK(0x34CCAF85, sceCameraGetSharpnessOff),
+    HOOK(0x4B5405C8, sceCameraSetSharpnessOff),
+};
 
-static int contrast[NB_CAM] = {127, 127};
+#define NB_HOOKS (sizeof(hookTable) / sizeof(hookTable[0]))
 
-static tai_hook_ref_t ref_hook11;
-static int hook_sceCameraGetContrast(int devnum, int *pLevel)
-{
-    int res = TAI_CONTINUE(int, ref_hook11, devnum, pLevel);
-    if ((unsigned int)devnum < NB_CAM && NULL != pLevel && res < 0)
-    {
-        *pLevel = contrast[devnum];
-        res = 0;
-    }
-    return res;
-}
-
-static tai_hook_ref_t ref_hook12;
-static int hook_sceCameraSetContrast(int devnum, int level)
-{
-    int res = TAI_CONTINUE(int, ref_hook12, devnum, level);
-    if ((unsigned int)devnum < NB_CAM && res < 0)
-    {
-        contrast[devnum] = level;
-        res = 0;
-    }
-    return res;
-}
-
-// Sharpness
-
-static int sharpness[NB_CAM] = {SCE_CAMERA_SHARPNESS_100, SCE_CAMERA_SHARPNESS_100};
-
-static tai_hook_ref_t ref_hook13;
-static int hook_sceCameraGetSharpness(int devnum, int *pLevel)
-{
-    int res = TAI_CONTINUE(int, ref_hook13, devnum, pLevel);
-    if ((unsigned int)devnum < NB_CAM && NULL != pLevel && res < 0)
-    {
-        *pLevel = sharpness[devnum];
-        res = 0;
-    }
-    return res;
-}
-
-static tai_hook_ref_t ref_hook14;
-static int hook_sceCameraSetSharpness(int devnum, int level)
-{
-    int res = TAI_CONTINUE(int, ref_hook14, devnum, level);
-    if ((unsigned int)devnum < NB_CAM && res < 0)
-    {
-        sharpness[devnum] = level;
-        res = 0;
-    }
-    return res;
-}
-
-// Reverse
-
-static int reverse[NB_CAM] = {SCE_CAMERA_REVERSE_OFF, SCE_CAMERA_REVERSE_OFF};
-
-static tai_hook_ref_t ref_hook15;
-static int hook_sceCameraGetReverse(int devnum, int *pMode)
-{
-    int res = TAI_CONTINUE(int, ref_hook15, devnum, pMode);
-    if ((unsigned int)devnum < NB_CAM && NULL != pMode && res < 0)
-    {
-        *pMode = reverse[devnum];
-        res = 0;
-    }
-    return res;
-}
-
-static tai_hook_ref_t ref_hook16;
-static int hook_sceCameraSetReverse(int devnum, int mode)
-{
-    int res = TAI_CONTINUE(int, ref_hook16, devnum, mode);
-    if ((unsigned int)devnum < NB_CAM && res < 0)
-    {
-        reverse[devnum] = mode;
-        res = 0;
-    }
-    return res;
-}
-
-// Effect
-
-static int effect[NB_CAM] = {SCE_CAMERA_EFFECT_NORMAL, SCE_CAMERA_EFFECT_NORMAL};
-
-static tai_hook_ref_t ref_hook17;
-static int hook_sceCameraGetEffect(int devnum, int *pMode)
-{
-    int res = TAI_CONTINUE(int, ref_hook17, devnum, pMode);
-    if ((unsigned int)devnum < NB_CAM && NULL != pMode && res < 0)
-    {
-        *pMode = effect[devnum];
-        res = 0;
-    }
-    return res;
-}
-
-static tai_hook_ref_t ref_hook18;
-static int hook_sceCameraSetEffect(int devnum, int mode)
-{
-    int res = TAI_CONTINUE(int, ref_hook18, devnum, mode);
-    if ((unsigned int)devnum < NB_CAM && res < 0)
-    {
-        effect[devnum] = mode;
-        res = 0;
-    }
-    return res;
-}
-
-// EV
-
-static int ev[NB_CAM] = {SCE_CAMERA_EV_POSITIVE_0, SCE_CAMERA_EV_POSITIVE_0};
-
-static tai_hook_ref_t ref_hook19;
-static int hook_sceCameraGetEV(int devnum, int *pLevel)
-{
-    int res = TAI_CONTINUE(int, ref_hook19, devnum, pLevel);
-    if ((unsigned int)devnum < NB_CAM && NULL != pLevel && res < 0)
-    {
-        *pLevel = ev[devnum];
-        res = 0;
-    }
-    return res;
-}
-
-static tai_hook_ref_t ref_hook20;
-static int hook_sceCameraSetEV(int devnum, int level)
-{
-    int res = TAI_CONTINUE(int, ref_hook20, devnum, level);
-    if ((unsigned int)devnum < NB_CAM && res < 0)
-    {
-        ev[devnum] = level;
-        res = 0;
-    }
-    return res;
-}
-
-// Zoom
-
-static int zoom[NB_CAM] = {10, 10};
-
-static tai_hook_ref_t ref_hook21;
-static int hook_sceCameraGetZoom(int devnum, int *pLevel)
-{
-    int res = TAI_CONTINUE(int, ref_hook21, devnum, pLevel);
-    if ((unsigned int)devnum < NB_CAM && NULL != pLevel && res < 0)
-    {
-        *pLevel = zoom[devnum];
-        res = 0;
-    }
-    return res;
-}
-
-static tai_hook_ref_t ref_hook22;
-static int hook_sceCameraSetZoom(int devnum, int level)
-{
-    int res = TAI_CONTINUE(int, ref_hook22, devnum, level);
-    if ((unsigned int)devnum < NB_CAM && res < 0)
-    {
-        zoom[devnum] = level;
-        res = 0;
-    }
-    return res;
-}
-
-// AntiFlicker
-
-static int antiFlicker[NB_CAM] = {SCE_CAMERA_ANTIFLICKER_AUTO, SCE_CAMERA_ANTIFLICKER_AUTO};
-
-static tai_hook_ref_t ref_hook23;
-static int hook_sceCameraGetAntiFlicker(int devnum, int *pMode)
-{
-    int res = TAI_CONTINUE(int, ref_hook23, devnum, pMode);
-    if ((unsigned int)devnum < NB_CAM && NULL != pMode && res < 0)
-    {
-        *pMode = antiFlicker[devnum];
-        res = 0;
-    }
-    return res;
-}
-
-static tai_hook_ref_t ref_hook24;
-static int hook_sceCameraSetAntiFlicker(int devnum, int mode)
-{
-    int res = TAI_CONTINUE(int, ref_hook24, devnum, mode);
-    if ((unsigned int)devnum < NB_CAM && res < 0)
-    {
-        antiFlicker[devnum] = mode;
-        res = 0;
-    }
-    return res;
-}
-
-// ISO
-
-static int iso[NB_CAM] = {SCE_CAMERA_ISO_AUTO, SCE_CAMERA_ISO_AUTO};
-
-static tai_hook_ref_t ref_hook25;
-static int hook_sceCameraGetISO(int devnum, int *pMode)
-{
-    int res = TAI_CONTINUE(int, ref_hook25, devnum, pMode);
-    if ((unsigned int)devnum < NB_CAM && NULL != pMode && res < 0)
-    {
-        *pMode = iso[devnum];
-        res = 0;
-    }
-    return res;
-}
-
-static tai_hook_ref_t ref_hook26;
-static int hook_sceCameraSetISO(int devnum, int mode)
-{
-    int res = TAI_CONTINUE(int, ref_hook26, devnum, mode);
-    if ((unsigned int)devnum < NB_CAM && res < 0)
-    {
-        iso[devnum] = mode;
-        res = 0;
-    }
-    return res;
-}
-
-// Gain
-
-static int gain[NB_CAM] = {SCE_CAMERA_GAIN_AUTO, SCE_CAMERA_GAIN_AUTO};
-
-static tai_hook_ref_t ref_hook27;
-static int hook_sceCameraGetGain(int devnum, int *pMode)
-{
-    int res = TAI_CONTINUE(int, ref_hook27, devnum, pMode);
-    if ((unsigned int)devnum < NB_CAM && NULL != pMode && res < 0)
-    {
-        *pMode = gain[devnum];
-        res = 0;
-    }
-    return res;
-}
-
-static tai_hook_ref_t ref_hook28;
-static int hook_sceCameraSetGain(int devnum, int mode)
-{
-    int res = TAI_CONTINUE(int, ref_hook28, devnum, mode);
-    if ((unsigned int)devnum < NB_CAM && res < 0)
-    {
-        gain[devnum] = mode;
-        res = 0;
-    }
-    return res;
-}
-
-// WhiteBalance
-
-static int whiteBalance[NB_CAM] = {SCE_CAMERA_WB_AUTO, SCE_CAMERA_WB_AUTO};
-
-static tai_hook_ref_t ref_hook29;
-static int hook_sceCameraGetWhiteBalance(int devnum, int *pMode)
-{
-    int res = TAI_CONTINUE(int, ref_hook29, devnum, pMode);
-    if ((unsigned int)devnum < NB_CAM && NULL != pMode && res < 0)
-    {
-        *pMode = whiteBalance[devnum];
-        res = 0;
-    }
-    return res;
-}
-
-static tai_hook_ref_t ref_hook30;
-static int hook_sceCameraSetWhiteBalance(int devnum, int mode)
-{
-    int res = TAI_CONTINUE(int, ref_hook30, devnum, mode);
-    if ((unsigned int)devnum < NB_CAM && res < 0)
-    {
-        whiteBalance[devnum] = mode;
-        res = 0;
-    }
-    return res;
-}
-
-// Backlight
-
-static int backlight[NB_CAM] = {SCE_CAMERA_BACKLIGHT_OFF, SCE_CAMERA_BACKLIGHT_OFF};
-
-static tai_hook_ref_t ref_hook31;
-static int hook_sceCameraGetBacklight(int devnum, int *pMode)
-{
-    int res = TAI_CONTINUE(int, ref_hook31, devnum, pMode);
-    if ((unsigned int)devnum < NB_CAM && NULL != pMode && res < 0)
-    {
-        *pMode = backlight[devnum];
-        res = 0;
-    }
-    return res;
-}
-
-static tai_hook_ref_t ref_hook32;
-static int hook_sceCameraSetBacklight(int devnum, int mode)
-{
-    int res = TAI_CONTINUE(int, ref_hook32, devnum, mode);
-    if ((unsigned int)devnum < NB_CAM && res < 0)
-    {
-        backlight[devnum] = mode;
-        res = 0;
-    }
-    return res;
-}
-
-// Nightmode
-
-static int nightmode[NB_CAM] = {SCE_CAMERA_NIGHTMODE_OFF, SCE_CAMERA_NIGHTMODE_OFF};
-
-static tai_hook_ref_t ref_hook33;
-static int hook_sceCameraGetNightmode(int devnum, int *pMode)
-{
-    int res = TAI_CONTINUE(int, ref_hook33, devnum, pMode);
-    if ((unsigned int)devnum < NB_CAM && NULL != pMode && res < 0)
-    {
-        *pMode = nightmode[devnum];
-        res = 0;
-    }
-    return res;
-}
-
-static tai_hook_ref_t ref_hook34;
-static int hook_sceCameraSetNightmode(int devnum, int mode)
-{
-    int res = TAI_CONTINUE(int, ref_hook34, devnum, mode);
-    if ((unsigned int)devnum < NB_CAM && res < 0)
-    {
-        nightmode[devnum] = mode;
-        res = 0;
-    }
-    return res;
-}
-
-// ExposureCeiling
-
-static int exposureCeiling[NB_CAM] = {0, 0};
-
-static tai_hook_ref_t ref_hook35;
-static int hook_sceCameraGetExposureCeiling(int devnum, int *pMode)
-{
-    int res = TAI_CONTINUE(int, ref_hook35, devnum, pMode);
-    if ((unsigned int)devnum < NB_CAM && NULL != pMode && res < 0)
-    {
-        *pMode = exposureCeiling[devnum];
-        res = 0;
-    }
-    return res;
-}
-
-static tai_hook_ref_t ref_hook36;
-static int hook_sceCameraSetExposureCeiling(int devnum, int mode)
-{
-    int res = TAI_CONTINUE(int, ref_hook36, devnum, mode);
-    if ((unsigned int)devnum < NB_CAM && res < 0)
-    {
-        exposureCeiling[devnum] = mode;
-        res = 0;
-    }
-    return res;
-}
-
-// AutoControlHold
-
-static int autoControlHold[NB_CAM] = {0, 0};
-
-static tai_hook_ref_t ref_hook37;
-static int hook_sceCameraGetAutoControlHold(int devnum, int *pMode)
-{
-    int res = TAI_CONTINUE(int, ref_hook37, devnum, pMode);
-    if ((unsigned int)devnum < NB_CAM && NULL != pMode && res < 0)
-    {
-        *pMode = autoControlHold[devnum];
-        res = 0;
-    }
-    return res;
-}
-
-static tai_hook_ref_t ref_hook38;
-static int hook_sceCameraSetAutoControlHold(int devnum, int mode)
-{
-    int res = TAI_CONTINUE(int, ref_hook38, devnum, mode);
-    if ((unsigned int)devnum < NB_CAM && res < 0)
-    {
-        autoControlHold[devnum] = mode;
-        res = 0;
-    }
-    return res;
-}
-
+static SceUID g_hooks[NB_HOOKS];
 
 void _start() __attribute__ ((weak, alias ("module_start")));
 int module_start(SceSize argc, const void *args)
 {
-    //log_reset();
-    //LOG("Starting module\n");
-    
-#ifdef ENABLE_BMP
-    sceAppMgrAppParamGetString(0, 12, titleid , 16);
-    //LOG("App ID %s\n", titleid);
-#endif
+    (void)argc;
+    (void)args;
 
-    //log_flush();
+    sceAppMgrAppParamGetString(0, 12, titleid, sizeof(titleid));
+    titleid[sizeof(titleid) - 1] = '\0';
+    LoadConfig();
+    Log("FakeCamera " FAKECAMERA_VERSION " started in %s (motion %s, invert_x %s, invert_y %s, sensitivity %d)\n",
+        titleid, config.motion ? "on" : "off", config.invertX ? "on" : "off", config.invertY ? "on" : "off", config.sensitivity);
 
-    g_hooks[0] = taiHookFunctionImport(&ref_hook0, 
-                                        TAI_MAIN_MODULE,
-                                        0xDA91B3ED, // SceCamera
-                                        0xA462F801, // sceCameraOpen
-                                        hook_sceCameraOpen);
-    g_hooks[1] = taiHookFunctionImport(&ref_hook1, 
-                                        TAI_MAIN_MODULE,
-                                        0xDA91B3ED, // SceCamera
-                                        0xCD6E1CFC, // sceCameraClose
-                                        hook_sceCameraClose);
-    g_hooks[2] = taiHookFunctionImport(&ref_hook2, 
-                                        TAI_MAIN_MODULE,
-                                        0xDA91B3ED, // SceCamera
-                                        0xA8FEAE35, // sceCameraStart
-                                        hook_sceCameraStart);
-    g_hooks[3] = taiHookFunctionImport(&ref_hook3, 
-                                        TAI_MAIN_MODULE,
-                                        0xDA91B3ED, // SceCamera
-                                        0x1DD9C9CE, // sceCameraStop
-                                        hook_sceCameraStop);
-    g_hooks[4] = taiHookFunctionImport(&ref_hook4, 
-                                        TAI_MAIN_MODULE,
-                                        0xDA91B3ED, // SceCamera
-                                        0x79B5C2DE, // sceCameraRead
-                                        hook_sceCameraRead);
-    g_hooks[5] = taiHookFunctionImport(&ref_hook5, 
-                                        TAI_MAIN_MODULE,
-                                        0xDA91B3ED, // SceCamera
-                                        0x103A75B8, // sceCameraIsActive
-                                        hook_sceCameraIsActive);
-    g_hooks[6] = taiHookFunctionImport(&ref_hook6, 
-                                        TAI_MAIN_MODULE,
-                                        0xDA91B3ED, // SceCamera
-                                        0x274EF751, // sceCameraGetDeviceLocation
-                                        hook_sceCameraGetDeviceLocation);
+    for (unsigned int i = 0; i < NB_HOOKS; i++)
+    {
+        g_hooks[i] = taiHookFunctionImport(hookTable[i].ref, TAI_MAIN_MODULE, SCECAMERA_LIBRARY_NID, hookTable[i].nid, hookTable[i].func);
+    }
 
-    // Getters - Setters
-    g_hooks[7] = taiHookFunctionImport(&ref_hook7, 
-                                        TAI_MAIN_MODULE,
-                                        0xDA91B3ED, // SceCamera
-                                        0x624F7653, // sceCameraGetSaturation
-                                        hook_sceCameraGetSaturation);
-    g_hooks[8] = taiHookFunctionImport(&ref_hook8, 
-                                        TAI_MAIN_MODULE,
-                                        0xDA91B3ED, // SceCamera
-                                        0xF9F7CA3D, // sceCameraSetSaturation
-                                        hook_sceCameraSetSaturation);
-    g_hooks[9] = taiHookFunctionImport(&ref_hook9, 
-                                        TAI_MAIN_MODULE,
-                                        0xDA91B3ED, // SceCamera
-                                        0x85D5951D, // sceCameraGetBrightness
-                                        hook_sceCameraGetBrightness);
-    g_hooks[10] = taiHookFunctionImport(&ref_hook10, 
-                                        TAI_MAIN_MODULE,
-                                        0xDA91B3ED, // SceCamera
-                                        0x98D71588, // sceCameraSetBrightness
-                                        hook_sceCameraSetBrightness);
-    g_hooks[11] = taiHookFunctionImport(&ref_hook11, 
-                                        TAI_MAIN_MODULE,
-                                        0xDA91B3ED, // SceCamera
-                                        0x8FBE84BE, // sceCameraGetContrast
-                                        hook_sceCameraGetContrast);
-    g_hooks[12] = taiHookFunctionImport(&ref_hook12, 
-                                        TAI_MAIN_MODULE,
-                                        0xDA91B3ED, // SceCamera
-                                        0x6FB2900, // sceCameraSetContrast
-                                        hook_sceCameraSetContrast);
-    g_hooks[13] = taiHookFunctionImport(&ref_hook13, 
-                                        TAI_MAIN_MODULE,
-                                        0xDA91B3ED, // SceCamera
-                                        0xAA72C3DC, // sceCameraGetSharpness
-                                        hook_sceCameraGetSharpness);
-    g_hooks[14] = taiHookFunctionImport(&ref_hook14, 
-                                        TAI_MAIN_MODULE,
-                                        0xDA91B3ED, // SceCamera
-                                        0xD1A5BB0B, // sceCameraSetSharpness
-                                        hook_sceCameraSetSharpness);
-    g_hooks[15] = taiHookFunctionImport(&ref_hook15, 
-                                        TAI_MAIN_MODULE,
-                                        0xDA91B3ED, // SceCamera
-                                        0x44F6043F, // sceCameraGetReverse
-                                        hook_sceCameraGetReverse);
-    g_hooks[16] = taiHookFunctionImport(&ref_hook16, 
-                                        TAI_MAIN_MODULE,
-                                        0xDA91B3ED, // SceCamera
-                                        0x1175F477, // sceCameraSetReverse
-                                        hook_sceCameraSetReverse);
-    g_hooks[17] = taiHookFunctionImport(&ref_hook17, 
-                                        TAI_MAIN_MODULE,
-                                        0xDA91B3ED, // SceCamera
-                                        0x7E8EF3B2, // sceCameraGetEffect
-                                        hook_sceCameraGetEffect);
-    g_hooks[18] = taiHookFunctionImport(&ref_hook18, 
-                                        TAI_MAIN_MODULE,
-                                        0xDA91B3ED, // SceCamera
-                                        0xE9D2CFB1, // sceCameraSetEffect
-                                        hook_sceCameraSetEffect);
-    g_hooks[19] = taiHookFunctionImport(&ref_hook19, 
-                                        TAI_MAIN_MODULE,
-                                        0xDA91B3ED, // SceCamera
-                                        0x8B5E6147, // sceCameraGetEV
-                                        hook_sceCameraGetEV);
-    g_hooks[20] = taiHookFunctionImport(&ref_hook20, 
-                                        TAI_MAIN_MODULE,
-                                        0xDA91B3ED, // SceCamera
-                                        0x62AFF0B8, // sceCameraSetEV
-                                        hook_sceCameraSetEV);
-    g_hooks[21] = taiHookFunctionImport(&ref_hook21, 
-                                        TAI_MAIN_MODULE,
-                                        0xDA91B3ED, // SceCamera
-                                        0x06D3816C, // sceCameraGetZoom
-                                        hook_sceCameraGetZoom);
-    g_hooks[22] = taiHookFunctionImport(&ref_hook22, 
-                                        TAI_MAIN_MODULE,
-                                        0xDA91B3ED, // SceCamera
-                                        0xF7464216, // sceCameraSetZoom
-                                        hook_sceCameraSetZoom);
-    g_hooks[23] = taiHookFunctionImport(&ref_hook23, 
-                                        TAI_MAIN_MODULE,
-                                        0xDA91B3ED, // SceCamera
-                                        0x9FDACB99, // sceCameraGetAntiFlicker
-                                        hook_sceCameraGetAntiFlicker);
-    g_hooks[24] = taiHookFunctionImport(&ref_hook24, 
-                                        TAI_MAIN_MODULE,
-                                        0xDA91B3ED, // SceCamera
-                                        0xE312958A, // sceCameraSetAntiFlicker
-                                        hook_sceCameraSetAntiFlicker);
-    g_hooks[25] = taiHookFunctionImport(&ref_hook25, 
-                                        TAI_MAIN_MODULE,
-                                        0xDA91B3ED, // SceCamera
-                                        0x4EBD5C68, // sceCameraGetISO
-                                        hook_sceCameraGetISO);
-    g_hooks[26] = taiHookFunctionImport(&ref_hook26, 
-                                        TAI_MAIN_MODULE,
-                                        0xDA91B3ED, // SceCamera
-                                        0x3CF630A1, // sceCameraSetISO
-                                        hook_sceCameraSetISO);
-    g_hooks[27] = taiHookFunctionImport(&ref_hook27, 
-                                        TAI_MAIN_MODULE,
-                                        0xDA91B3ED, // SceCamera
-                                        0x2C36D6F3, // sceCameraGetGain
-                                        hook_sceCameraGetGain);
-    g_hooks[28] = taiHookFunctionImport(&ref_hook28, 
-                                        TAI_MAIN_MODULE,
-                                        0xDA91B3ED, // SceCamera
-                                        0xE65CFE86, // sceCameraSetGain
-                                        hook_sceCameraSetGain);
-    g_hooks[29] = taiHookFunctionImport(&ref_hook29, 
-                                        TAI_MAIN_MODULE,
-                                        0xDA91B3ED, // SceCamera
-                                        0xDBFFA1DA, // sceCameraGetWhiteBalance
-                                        hook_sceCameraGetWhiteBalance);                                        
-    g_hooks[30] = taiHookFunctionImport(&ref_hook30, 
-                                        TAI_MAIN_MODULE,
-                                        0xDA91B3ED, // SceCamera
-                                        0x4D4514AC, // sceCameraSetWhiteBalance
-                                        hook_sceCameraSetWhiteBalance);
-    g_hooks[31] = taiHookFunctionImport(&ref_hook31, 
-                                        TAI_MAIN_MODULE,
-                                        0xDA91B3ED, // SceCamera
-                                        0x8DD1292B, // sceCameraGetBacklight
-                                        hook_sceCameraGetBacklight);
-    g_hooks[32] = taiHookFunctionImport(&ref_hook32, 
-                                        TAI_MAIN_MODULE,
-                                        0xDA91B3ED, // SceCamera
-                                        0xAE071044, // sceCameraSetBacklight
-                                        hook_sceCameraSetBacklight);
-    g_hooks[33] = taiHookFunctionImport(&ref_hook33, 
-                                        TAI_MAIN_MODULE,
-                                        0xDA91B3ED, // SceCamera
-                                        0x12B6FF26, // sceCameraGetNightmode
-                                        hook_sceCameraGetNightmode);
-    g_hooks[34] = taiHookFunctionImport(&ref_hook34, 
-                                        TAI_MAIN_MODULE,
-                                        0xDA91B3ED, // SceCamera
-                                        0x3F26233E, // sceCameraSetNightmode
-                                        hook_sceCameraSetNightmode);
-    g_hooks[35] = taiHookFunctionImport(&ref_hook35, 
-                                        TAI_MAIN_MODULE,
-                                        0xDA91B3ED, // SceCamera
-                                        0x5FA5B1BB, // sceCameraGetExposureCeiling
-                                        hook_sceCameraGetExposureCeiling);
-    g_hooks[36] = taiHookFunctionImport(&ref_hook36, 
-                                        TAI_MAIN_MODULE,
-                                        0xDA91B3ED, // SceCamera
-                                        0x4F34BEE, // sceCameraSetExposureCeiling
-                                        hook_sceCameraSetExposureCeiling);
-    g_hooks[37] = taiHookFunctionImport(&ref_hook37, 
-                                        TAI_MAIN_MODULE,
-                                        0xDA91B3ED, // SceCamera
-                                        0x06A21BBB, // sceCameraGetAutoControlHold
-                                        hook_sceCameraGetAutoControlHold);
-    g_hooks[38] = taiHookFunctionImport(&ref_hook38, 
-                                        TAI_MAIN_MODULE,
-                                        0xDA91B3ED, // SceCamera
-                                        0x3A0DABBD, // sceCameraSetAutoControlHold
-                                        hook_sceCameraSetAutoControlHold);
     return SCE_KERNEL_START_SUCCESS;
 }
 
 int module_stop(SceSize argc, const void *args)
 {
-    if (g_hooks[0] >= 0) taiHookRelease(g_hooks[0], ref_hook0);
-    if (g_hooks[1] >= 0) taiHookRelease(g_hooks[1], ref_hook1);
-    if (g_hooks[2] >= 0) taiHookRelease(g_hooks[2], ref_hook2);
-    if (g_hooks[3] >= 0) taiHookRelease(g_hooks[3], ref_hook3);
-    if (g_hooks[4] >= 0) taiHookRelease(g_hooks[4], ref_hook4);
-    if (g_hooks[5] >= 0) taiHookRelease(g_hooks[5], ref_hook5);
-    if (g_hooks[6] >= 0) taiHookRelease(g_hooks[6], ref_hook6);
-    if (g_hooks[7] >= 0) taiHookRelease(g_hooks[7], ref_hook7);
-    if (g_hooks[8] >= 0) taiHookRelease(g_hooks[8], ref_hook8);
-    if (g_hooks[9] >= 0) taiHookRelease(g_hooks[9], ref_hook9);
-    if (g_hooks[10] >= 0) taiHookRelease(g_hooks[10], ref_hook10);
-    if (g_hooks[11] >= 0) taiHookRelease(g_hooks[11], ref_hook11);
-    if (g_hooks[12] >= 0) taiHookRelease(g_hooks[12], ref_hook12);
-    if (g_hooks[13] >= 0) taiHookRelease(g_hooks[13], ref_hook13);
-    if (g_hooks[14] >= 0) taiHookRelease(g_hooks[14], ref_hook14);
-    if (g_hooks[15] >= 0) taiHookRelease(g_hooks[15], ref_hook15);
-    if (g_hooks[16] >= 0) taiHookRelease(g_hooks[16], ref_hook16);
-    if (g_hooks[17] >= 0) taiHookRelease(g_hooks[17], ref_hook17);
-    if (g_hooks[18] >= 0) taiHookRelease(g_hooks[18], ref_hook18);
-    if (g_hooks[19] >= 0) taiHookRelease(g_hooks[19], ref_hook19);
-    if (g_hooks[20] >= 0) taiHookRelease(g_hooks[20], ref_hook20);
-    if (g_hooks[21] >= 0) taiHookRelease(g_hooks[21], ref_hook21);
-    if (g_hooks[22] >= 0) taiHookRelease(g_hooks[22], ref_hook22);
-    if (g_hooks[23] >= 0) taiHookRelease(g_hooks[23], ref_hook23);
-    if (g_hooks[24] >= 0) taiHookRelease(g_hooks[24], ref_hook24);
-    if (g_hooks[25] >= 0) taiHookRelease(g_hooks[25], ref_hook25);
-    if (g_hooks[26] >= 0) taiHookRelease(g_hooks[26], ref_hook26);
-    if (g_hooks[27] >= 0) taiHookRelease(g_hooks[27], ref_hook27);
-    if (g_hooks[28] >= 0) taiHookRelease(g_hooks[28], ref_hook28);
-    if (g_hooks[29] >= 0) taiHookRelease(g_hooks[29], ref_hook29);
-    if (g_hooks[30] >= 0) taiHookRelease(g_hooks[30], ref_hook30);
-    if (g_hooks[31] >= 0) taiHookRelease(g_hooks[31], ref_hook31);
-    if (g_hooks[32] >= 0) taiHookRelease(g_hooks[32], ref_hook32);
-    if (g_hooks[33] >= 0) taiHookRelease(g_hooks[33], ref_hook33);
-    if (g_hooks[34] >= 0) taiHookRelease(g_hooks[34], ref_hook34);
-    if (g_hooks[35] >= 0) taiHookRelease(g_hooks[35], ref_hook35);
-    if (g_hooks[36] >= 0) taiHookRelease(g_hooks[36], ref_hook36);
-    if (g_hooks[37] >= 0) taiHookRelease(g_hooks[37], ref_hook37);
-    if (g_hooks[38] >= 0) taiHookRelease(g_hooks[38], ref_hook38);
+    (void)argc;
+    (void)args;
+
+    for (unsigned int i = 0; i < NB_HOOKS; i++)
+    {
+        if (g_hooks[i] >= 0)
+            taiHookRelease(g_hooks[i], *hookTable[i].ref);
+    }
+
+    MotionStopSampling();
+    for (int i = 0; i < NB_CAM; i++)
+        FreeImageBuffers(&imageBuffers[i]);
 
     return SCE_KERNEL_STOP_SUCCESS;
 }

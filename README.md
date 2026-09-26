@@ -1,75 +1,113 @@
 # FakeCamera
 
-Henkaku plugin that fakes invalid camera calls in order to avoid some crashes for some titles on PlayStation TV.
+taiHEN plugin that fakes the PS Vita camera on **PlayStation TV** (or on a PS Vita whose camera is broken). Titles which crash or lock when they try to use the camera get the answers they expect instead, and you can even choose a BMP image to be shown as the camera picture.
 
-Of course, those titles have been blocked by Sony and you must previously unlock them in order to launch them.
-Use an application like AntiBlackList (from Rinnegatamante) to do it:
-http://vitadb.rinnegatamante.it/#/info/11
+Most of those titles are blocked by Sony on PS TV: unlock them first with an application like [AntiBlackList](http://vitadb.rinnegatamante.it/#/info/11) by Rinnegatamante.
 
-Once titles are unlocked, they could crash due unexpected SceCamera API answers (because they were never conceived to run on a device without camera). This is where this plugin could intervene to "simulate" expected answers and, therefore, avoid some crashes.
-
-With "fakecamerabmp.suprx" or "fakecamerakbmp.suprx" plugin, a BMP file image can be loaded and used as camera output. Images must be placed in "ux0:data/FakeCamera" directory. An image is selected in this directory with the following priority:
- * "ux0:data/FakeCamera/TITLEID00_Front.bmp" or "ux0:data/FakeCamera/TITLEID00_Back.bmp" (depends on front or back camera use)
- * "ux0:data/FakeCamera/TITLEID00.bmp"
- * "ux0:data/FakeCamera/ALL_Front.bmp" or "ux0:data/FakeCamera/ALL_Back.bmp" (depends on front or back camera use)
- * "ux0:data/FakeCamera/ALL.bmp"
+Version 1.3 is a single plugin with no special dependency (see [Upgrading from 1.2](#upgrading-from-12) if you used an older version).
 
 
-### Dependencies
+## Installation
 
-The plugin "fakecamera.suprx" doesn't have any dependency.
+1. Copy `fakecamera.suprx` to `ux0:tai/` (or `ur0:tai/` if that is where your plugins live).
+2. In `ux0:tai/config.txt` (or `ur0:tai/config.txt`), add the plugin under the title which needs it:
 
-The plugin "fakecamerabmp.suprx" depends on an additional kernel plugin:
- * **dsmotion.skprx** (https://github.com/OperationNT414C/DSMotion) for image scrolling with motion controls
+   ```
+   *PCSF00007
+   ux0:tai/fakecamera.suprx
+   ```
 
-For "fakecamerakbmp.suprx", there is also another dependency on the following kernel plugin:
- * **kuio.skprx** (https://github.com/Rinnegatamante/kuio) for file system access with kernel privilege
+   Replace `PCSF00007` by the title identifier, or use `*ALL` to enable it for every title.
+3. Launch the title (reboot if it was already running).
 
-Those dependencies must be loaded otherwise "fakecamerabmp.suprx" or "fakecamerakbmp.suprx" won't load.
- 
+The plugin only acts when the real camera cannot be opened, so it is harmless on a PS Vita with a working camera.
 
-### Installation
 
-For each title which crashes when it should activate the camera, you can add those lines in `ux0:tai/config.txt`:
+## Camera image (optional)
+
+Without any image, the camera picture stays black. To show a picture, place a BMP file in `ux0:data/FakeCamera/` (create the directory). For each camera opened by a title, the first existing file in this list is used:
+
+ 1. `ux0:data/FakeCamera/TITLEID00_Front.bmp` or `ux0:data/FakeCamera/TITLEID00_Back.bmp` (depending on the camera used)
+ 2. `ux0:data/FakeCamera/TITLEID00.bmp`
+ 3. `ux0:data/FakeCamera/ALL_Front.bmp` or `ux0:data/FakeCamera/ALL_Back.bmp`
+ 4. `ux0:data/FakeCamera/ALL.bmp`
+
+Image requirements:
+
+ * Uncompressed BMP, 16, 24 or 32 bits per pixel, up to 2048x2048 (both bottom-up and top-down files are accepted). Compressed or paletted BMP files are rejected.
+ * The image is converted into the exact format the title asks for (ARGB, ABGR, YUV422 or YUV420), so any size works. An image bigger than the camera resolution is cropped (and can be scrolled by tilting, see below); a smaller one is centered with black borders.
+ * A few titles only stand small pictures: WipEout 2048 for instance works with a 64x64 image.
+
+### Titles which cannot read `ux0:`
+
+Some titles run in a sandbox which hides `ux0:` from them, so the image cannot be loaded (Frobisher Says is one of them, the picture stays black). For those, install **ioPlus**, a kernel plugin which lets every process use the ordinary file functions on `ux0:`:
+
+ * Get `ioplus.skprx` from https://github.com/delon5/ioplus (or the original ioPlus 0.1 by dots-tb).
+ * Copy it to `ur0:tai/` and add it under `*KERNEL` in your `config.txt`, above other plugins:
+
+   ```
+   *KERNEL
+   ur0:tai/ioplus.skprx
+   ```
+
+Other plugins (VitaGrafix, iTLS-Enso...) already need it, so you may have it installed already.
+
+
+## Tilt scrolling
+
+When the image is bigger than the camera resolution, the visible part follows the tilt of the device: lean to the right to see the right part of the picture, lean forward to see the bottom, and so on. This uses the system motion sensors through the standard `SceMotion` library, so:
+
+ * on a **PS Vita**, the built-in sensors are used, nothing to install;
+ * on a **PS TV**, the sensors of a DualShock 3 or 4 are used as soon as a motion emulator feeds them to the system. [PSVshell+](https://github.com/delon5/PSV-Shell-Plus) does it once its "Bt Motion" option is enabled in the profile of the title; [ds34motion](https://github.com/MERLev/ds34motion) and the older [DSMotion](https://github.com/OperationNT414C/DSMotion) work too. Enable the emulator before starting the title;
+ * without any motion source, the picture simply stays centered.
+
+Motion is started only when an image is actually loaded; titles which do not get a picture are not affected.
+
+
+## Configuration (optional)
+
+A `ux0:data/FakeCamera/config.txt` file can tune the plugin. Every line is a `key=value` pair, `#` starts a comment, and the defaults are:
 
 ```
-*TITLEID00
-ux0:tai/fakecamera.suprx
+# Tilt scrolling of a large image (on/off)
+motion=on
+# Invert the scrolling direction (on/off), in case it feels reversed with your motion emulator
+invert_x=off
+invert_y=off
+# Tilt sensitivity in percent: at 100, about 57 degrees of tilt reach the edge of the image
+sensitivity=100
+# Write what happens in ux0:data/FakeCamera/log.txt (on/off)
+log=off
 ```
 
-OR (even if the title doesn't crash, it will allow you to set up a BMP image as camera output)
 
-```
-*KERNEL
-ux0:tai/dsmotion.skprx
+## Troubleshooting
 
-*TITLEID00
-ux0:tai/fakecamerabmp.suprx
-```
+ * **The title still crashes**: check that the plugin line is under the right title identifier (or `*ALL`) and that no other camera plugin is loaded for it.
+ * **The picture stays black**: the BMP file is missing, misnamed or unsupported, or the title cannot read `ux0:` (see [ioPlus](#titles-which-cannot-read-ux0)). Set `log=on` in the configuration file and look at `ux0:data/FakeCamera/log.txt`: it tells which file was tried and why it was refused. Writing the log needs the same access as reading the image, so it is empty for sandboxed titles without ioPlus.
+ * **The image does not scroll**: no motion source is available (see [Tilt scrolling](#tilt-scrolling)), or the image is not bigger than the camera resolution. The log tells whether `SceMotion` was found and started.
+ * **The image scrolls in the wrong direction**: set `invert_x=on` and/or `invert_y=on`.
 
-OR (if the BMP file loading doesn't work with normal rights)
-
-```
-*KERNEL
-ux0:tai/dsmotion.skprx
-ux0:tai/kuio.skprx
-
-*TITLEID00
-ux0:tai/fakecamerakbmp.suprx
-```
-
-Replace **TITLEID00** by your title identifier or by **ALL** to affect all titles.
-
-DO NOT use "fakecamera.suprx", "fakecamerabmp.suprx" or "fakecamerakbmp.suprx" on the same configuration!
+Please report the titles you test, with the log, so that the compatibility lists below can grow.
 
 
-### Compatibility
+## Upgrading from 1.2
+
+Version 1.2 came as three plugins: `fakecamera.suprx`, `fakecamerabmp.suprx` (image support, needed `dsmotion.skprx`) and `fakecamerakbmp.suprx` (also needed `kuio.skprx`). All three are replaced by the single `fakecamera.suprx`:
+
+ * replace any `fakecamerabmp.suprx` or `fakecamerakbmp.suprx` line in `config.txt` by `fakecamera.suprx`;
+ * `dsmotion.skprx` and `kuio.skprx` are no longer needed by FakeCamera. If nothing else uses them, remove their lines from the `*KERNEL` section (PSVshell+ users: it replaces DSMotion anyway);
+ * if `fakecamerakbmp.suprx` was needed for a title, install [ioPlus](#titles-which-cannot-read-ux0) instead of `kuio.skprx`;
+ * images and their names in `ux0:data/FakeCamera/` are unchanged.
+
+
+## Compatibility
 
  * PCSF00007 - WipEout 2048 - The game won't crash on a multiplayer session start! (due to the useless picture feature)
- * PCSF00214 - Tearaway - It won't crash but it will be locked on some asked interactions, like shaking the PS Vita (use DSMotion to by-pass this problem)
+ * PCSF00214 - Tearaway - It won't crash but it will be locked on some asked interactions, like shaking the PS Vita (use a motion emulator to by-pass this problem)
 
 
-### BMP load compatibility
+## Image compatibility
 
  * PCM300001 - Pro Camera Vita - Works fine
  * VITASHELL - Vita Shell - Works fine in QR scan feature
@@ -77,12 +115,28 @@ DO NOT use "fakecamera.suprx", "fakecamerabmp.suprx" or "fakecamerakbmp.suprx" o
  * PCSB00031 - Virtua Tennis 4 - Works fine in "CAM VT" mode (packed YUV422 format test case)
  * PCSF00214 - Tearaway - Works fine
  * PCSF00007 - WipEout 2048 - Works fine with low resolution images (tested with 64x64)
- * PCSF00043 - Frobisher Says - "fakecamerakbmp.suprx" is mandatory! Works fine (planed YUV420 format test case) but loading times are highly slowed down
+ * PCSF00043 - Frobisher Says - Needs ioPlus (planar YUV420 format test case), and loading times are highly slowed down
 
-Please report if you find a title where this feature doesn't work (just check with a low resolution BMP image and "fakecamerakbmp.suprx" before reporting).
+Those results were obtained with version 1.2; the 1.3 image loading and scrolling changes have not yet been confirmed on hardware, reports are welcome.
 
 
-### Credits
+## Building
 
- * **Rinnegatamante** for "AntiBlackList" application and his "kuio.skprx" plugin
- * **xerpi** for his "libvita2d" source code which inspired me for BMP format read
+With [VitaSDK](https://vitasdk.org/) installed and `VITASDK` set:
+
+```sh
+cmake -S . -B build
+cmake --build build
+```
+
+The plugin is `build/fakecamera.suprx`. Every push is also built by GitHub Actions (the `fakecamera` artifact of the workflow run), and a `release/` copy is committed with its checksum.
+
+
+## Credits
+
+ * **OperationNT414C** for FakeCamera and DSMotion
+ * **Rinnegatamante** for AntiBlackList and kuio
+ * **dots-tb** for ioPlus
+ * **xerpi** for libvita2d, whose BMP reader inspired this one
+ * **Electry** and **MERLev** for PSVshell and ds34motion, which PSVshell+ builds on
+ * **VitaSDK** for the toolchain and the NID database
