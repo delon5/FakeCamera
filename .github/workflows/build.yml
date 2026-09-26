@@ -20,23 +20,13 @@ jobs:
           cmake --build build
           sha256sum build/fakecamera.suprx
 
-      - name: Build the release zip
-        run: python3 tools/make_package.py --plugin build/fakecamera.suprx --out FakeCamera-package.zip
-
       - uses: actions/upload-artifact@v4
         with:
           name: fakecamera
           path: build/fakecamera.suprx
 
-      - uses: actions/upload-artifact@v4
-        with:
-          name: FakeCamera-package
-          path: FakeCamera-package.zip
-
       - name: Attach to release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: |
-            build/fakecamera.suprx
-            FakeCamera-package.zip
+          files: build/fakecamera.suprx

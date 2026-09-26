@@ -7,23 +7,7 @@ Most of those titles are blocked by Sony on PS TV: unlock them first with an app
 Version 1.3 is a single plugin with no special dependency (see [Upgrading from 1.2](#upgrading-from-12) if you used an older version).
 
 
-## Automatic install
-
-Download `FakeCamera-1.3.zip` from the [releases](https://github.com/delon5/FakeCamera/releases) (or the `FakeCamera-package` artifact of a workflow run), extract it, then:
-
-1. On the console, open VitaShell and press SELECT to start its FTP server; it shows an address such as `192.168.1.20:1337`.
-2. On the PC (Python 3 needed), from the extracted folder:
-
-   ```sh
-   python3 install.py 192.168.1.20
-   ```
-
-3. Reboot the console.
-
-The installer uploads the plugin, the [ready-made pictures](#ready-made-templates) and their `config.txt`, downloads and installs ioPlus, and adds the lines to the taiHEN `config.txt` it finds active (a backup is kept). Nothing is left to configure: every title gets the plugin (`*ALL`) and the picture prepared for it. `python3 install.py --help` lists the options (`--no-ioplus`, `--dry-run`, `--offline DIR` to get the memory card layout for a manual copy). The zip also works without the script: copy the content of its `ux0` folder to `ux0:` and follow the manual steps below.
-
-
-## Manual install
+## Installation
 
 1. Copy `fakecamera.suprx` to `ux0:tai/` (or `ur0:tai/` if that is where your plugins live).
 2. In `ux0:tai/config.txt` (or `ur0:tai/config.txt`), add the plugin under the title which needs it:
@@ -169,7 +153,7 @@ cmake -S . -B build
 cmake --build build
 ```
 
-The plugin is `build/fakecamera.suprx`, and `python3 tools/make_package.py` builds the release zip (plugin, pictures, installer). Every push is also built by GitHub Actions (the `fakecamera` and `FakeCamera-package` artifacts of the workflow run, attached to the release on a tag), and a `release/` copy of the plugin is committed with its checksum.
+The plugin is `build/fakecamera.suprx`. Every push is also built by GitHub Actions (the `fakecamera` artifact of the workflow run), and a `release/` copy is committed with its checksum.
 
 
 ## Credits
