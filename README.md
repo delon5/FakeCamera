@@ -76,10 +76,12 @@ A `ux0:data/FakeCamera/config.txt` file can tune the plugin. Every line is a `ke
 ```
 # Picture for both cameras (image), or for one of them (front, back, which
 # override image): a file in ux0:data/FakeCamera or a full path, tried before
-# the TITLEID/ALL names
+# the TITLEID/ALL names. Several names separated by commas take turns
 image=
 front=
 back=
+# Seconds between two pictures of a list (0: the next one at each camera opening)
+cycle=0
 # Tilt scrolling of a large image (on/off)
 motion=on
 # Invert the scrolling direction (on/off), in case it feels reversed with your motion emulator

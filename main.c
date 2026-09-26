@@ -76,6 +76,9 @@ static float atan2_approx(float y, float x)
 //                      full path), tried before the TITLEID/ALL file names
 //   front=name.bmp     picture for the front camera only (overrides "image")
 //   back=name.bmp      picture for the back camera only (overrides "image")
+//   cycle=0            several pictures can be listed (a.bmp,b.bmp,c.bmp): the
+//                      next one is used at each camera opening, or every
+//                      "cycle" seconds while the camera stays open
 //
 // The keys before any "*TITLEID" line (or after "*ALL") apply to every title;
 // a "*TITLEID" line starts a section applying to that title only, on top of
@@ -83,7 +86,8 @@ static float atan2_approx(float y, float x)
 // ---------------------------------------------------------------------------
 
 #define CONFIG_MAX_SIZE 16384
-#define IMAGE_NAME_MAX  64
+#define IMAGE_LIST_MAX  256     // "image", "front" and "back" values: names separated by commas
+#define IMAGE_NAME_MAX  128
 
 typedef struct {
     int motion;
@@ -91,12 +95,13 @@ typedef struct {
     int invertY;
     int sensitivity;
     int log;
-    char image[IMAGE_NAME_MAX];
-    char front[IMAGE_NAME_MAX];
-    char back[IMAGE_NAME_MAX];
+    int cycle;
+    char image[IMAGE_LIST_MAX];
+    char front[IMAGE_LIST_MAX];
+    char back[IMAGE_LIST_MAX];
 } Config;
 
-static Config config = { 1, 0, 0, 100, 0, "", "", "" };
+static Config config = { 1, 0, 0, 100, 0, 0, "", "", "" };
 static char configText[CONFIG_MAX_SIZE];
 static char titleid[16] = "";
 
@@ -152,8 +157,58 @@ static int ParseBool(const char* v)
 
 static void CopyName(char* oName, const char* iValue)
 {
-    strncpy(oName, iValue, IMAGE_NAME_MAX - 1);
-    oName[IMAGE_NAME_MAX - 1] = '\0';
+    strncpy(oName, iValue, IMAGE_LIST_MAX - 1);
+    oName[IMAGE_LIST_MAX - 1] = '\0';
+}
+
+// Number of names in a comma separated list
+static int ImageListCount(const char* iList)
+{
+    int count = 0;
+    const char* p = iList;
+    while ('\0' != *p)
+    {
+        const char* end = strchr(p, ',');
+        size_t len = (NULL != end) ? (size_t)(end - p) : strlen(p);
+        while (len > 0 && (' ' == *p || '\t' == *p)) { p++; len--; }
+        while (len > 0 && (' ' == p[len - 1] || '\t' == p[len - 1])) len--;
+        if (len > 0)
+            count++;
+        p += (NULL != end) ? (size_t)(end - p) + 1 : strlen(p);
+    }
+    return count;
+}
+
+// Copies the iIndex-th name (modulo the count) of a comma separated list
+static int ImageListGet(const char* iList, int iIndex, char* oName, size_t iNameSize)
+{
+    int count = ImageListCount(iList);
+    if (count <= 0)
+        return 0;
+    int wanted = ((iIndex % count) + count) % count;
+    const char* p = iList;
+    while ('\0' != *p)
+    {
+        const char* end = strchr(p, ',');
+        size_t len = (NULL != end) ? (size_t)(end - p) : strlen(p);
+        const char* start = p;
+        while (len > 0 && (' ' == *start || '\t' == *start)) { start++; len--; }
+        while (len > 0 && (' ' == start[len - 1] || '\t' == start[len - 1])) len--;
+        if (len > 0)
+        {
+            if (0 == wanted)
+            {
+                if (len >= iNameSize)
+                    len = iNameSize - 1;
+                memcpy(oName, start, len);
+                oName[len] = '\0';
+                return 1;
+            }
+            wanted--;
+        }
+        p += (NULL != end) ? (size_t)(end - p) + 1 : strlen(p);
+    }
+    return 0;
 }
 
 static void ApplyConfigValue(const char* key, const char* val)
@@ -172,6 +227,12 @@ static void ApplyConfigValue(const char* key, const char* val)
     }
     else if (KeyEquals(key, "log"))
         config.log = ParseBool(val);
+    else if (KeyEquals(key, "cycle"))
+    {
+        int c = atoi(val);
+        if (c >= 0 && c <= 3600)
+            config.cycle = c;
+    }
     else if (KeyEquals(key, "image"))
     {
         // both cameras: a later "front" or "back" line still overrides one of them
@@ -197,7 +258,7 @@ static void ApplyConfigSection(const char* iText, const char* iSection)
         size_t len = (NULL != end) ? (size_t)(end - p) : strlen(p);
         const char* next = p + len + ((NULL != end) ? 1 : 0);
 
-        char line[160];
+        char line[IMAGE_LIST_MAX + 64];
         if (len >= sizeof(line))
             len = sizeof(line) - 1;
         memcpy(line, p, len);
@@ -849,6 +910,11 @@ static void* VBufferOnOpen[NB_CAM] = {NULL, NULL};
 
 static ImageBuffers imageBuffers[NB_CAM] = { IMAGE_BUFFERS_INIT, IMAGE_BUFFERS_INIT };
 static SceCameraFormat imageFormat[NB_CAM] = {0, 0};
+static SceCameraFormat openFormat[NB_CAM] = {0, 0};
+static char imageName[NB_CAM][IMAGE_NAME_MAX] = { "", "" };  // configured name currently loaded
+static int imageIndex[NB_CAM] = {0, 0};                      // position in the configured list
+static int imageBuf_opened[NB_CAM] = {0, 0};                 // camera openings so far
+static uint64_t imageSwitchTime[NB_CAM] = {0, 0};
 
 static int prevWidthOffset[NB_CAM] = {-1, -1};
 static int prevHeightOffset[NB_CAM] = {-1, -1};
@@ -872,15 +938,18 @@ static void BuildImagePath(char* oPath, size_t iPathSize, const char* iName)
 // Looks for an image in this order: the "front"/"back" then "image" names of
 // the configuration, then TITLEID_Front.bmp (or _Back), TITLEID.bmp,
 // ALL_Front.bmp (or _Back) and ALL.bmp
+static const char* ImageList(int devnum)
+{
+    return (1 == devnum) ? config.back : config.front;
+}
+
 static SceUID OpenImageFile(int devnum, char* oPath, size_t iPathSize)
 {
     SceUID fd = -1;
-    const char* configured[2] = { (1 == devnum) ? config.back : config.front, config.image };
-    for (int i = 0; i < 2; i++)
+    char name[IMAGE_NAME_MAX];
+    if (ImageListGet(ImageList(devnum), imageIndex[devnum], name, sizeof(name)))
     {
-        if ('\0' == configured[i][0])
-            continue;
-        BuildImagePath(oPath, iPathSize, configured[i]);
+        BuildImagePath(oPath, iPathSize, name);
         fd = sceIoOpen(oPath, SCE_O_RDONLY, 0);
         if (fd >= 0)
             return fd;
@@ -904,14 +973,19 @@ static SceUID OpenImageFile(int devnum, char* oPath, size_t iPathSize)
 static void LoadCameraImage(int devnum, SceCameraFormat iFormat)
 {
     ImageBuffers* imageBuf = &imageBuffers[devnum];
-    if (imageBuf->ready > 0 && imageFormat[devnum] == iFormat)
-        return; // already loaded for this format
+    char name[IMAGE_NAME_MAX] = "";
+    ImageListGet(ImageList(devnum), imageIndex[devnum], name, sizeof(name));
+    if (imageBuf->ready > 0 && imageFormat[devnum] == iFormat && 0 == strcmp(name, imageName[devnum]))
+        return; // already loaded for this format and name
 
     FreeImageBuffers(imageBuf);
     imageBuf->ready = 0;
     imageFormat[devnum] = SCE_CAMERA_FORMAT_INVALID;
+    snprintf(imageName[devnum], IMAGE_NAME_MAX, "%s", name);
+    prevWidthOffset[devnum] = -1;   // the camera buffers must be filled again
+    prevHeightOffset[devnum] = -1;
 
-    char pathname[128];
+    char pathname[256];
     SceUID fd = OpenImageFile(devnum, pathname, sizeof(pathname));
     if (fd < 0)
     {
@@ -984,6 +1058,10 @@ static int hook_sceCameraOpen(int devnum, SceCameraInfo *pInfo)
             }
 
             Log("Camera %s opened: %ux%u, format %d, framerate %u\n", camName[devnum], pInfo->width, pInfo->height, pInfo->format, pInfo->framerate);
+            openFormat[devnum] = pInfo->format;
+            if (0 == config.cycle && imageBuf_opened[devnum]++ > 0)
+                imageIndex[devnum]++;   // next picture of the list at each opening
+            imageSwitchTime[devnum] = sceKernelGetProcessTimeWide();
             LoadCameraImage(devnum, pInfo->format);
             if (imageBuffers[devnum].ready > 0)
                 MotionStartSampling();  // (re)start the tilt sampling for each opening
@@ -1180,6 +1258,14 @@ static int hook_sceCameraRead(int devnum, SceCameraRead *pRead)
                 buffers[2] = (NULL != VBufferOnOpen[devnum]) ? VBufferOnOpen[devnum] : pRead->pVBase;
             }
 
+            if (config.cycle > 0 && newTimeStamp - imageSwitchTime[devnum] >= (uint64_t)config.cycle * 1000000ull
+             && ImageListCount(ImageList(devnum)) > 1)
+            {
+                imageSwitchTime[devnum] = newTimeStamp;
+                imageIndex[devnum]++;
+                LoadCameraImage(devnum, openFormat[devnum]);
+            }
+
             int buffersChanged = (prevBuffers[devnum][0] != buffers[0] || prevBuffers[devnum][1] != buffers[1] || prevBuffers[devnum][2] != buffers[2]);
             if (imageBuf->ready > 0 && width[devnum] > 0 && height[devnum] > 0 && (prevFrame[devnum] < fakeFrame || buffersChanged))
             {
@@ -1336,9 +1422,9 @@ int module_start(SceSize argc, const void *args)
     sceAppMgrAppParamGetString(0, 12, titleid, sizeof(titleid));
     titleid[sizeof(titleid) - 1] = '\0';
     LoadConfig();
-    Log("FakeCamera " FAKECAMERA_VERSION " started in %s (motion %s, invert_x %s, invert_y %s, sensitivity %d, image \"%s\", front \"%s\", back \"%s\")\n",
-        titleid, config.motion ? "on" : "off", config.invertX ? "on" : "off", config.invertY ? "on" : "off", config.sensitivity,
-        config.image, config.front, config.back);
+    Log("FakeCamera " FAKECAMERA_VERSION " started in %s (motion %s, invert_x %s, invert_y %s, sensitivity %d, cycle %d, front \"%s\", back \"%s\")\n",
+        titleid, config.motion ? "on" : "off", config.invertX ? "on" : "off", config.invertY ? "on" : "off", config.sensitivity, config.cycle,
+        config.front, config.back);
 
     for (unsigned int i = 0; i < NB_HOOKS; i++)
     {

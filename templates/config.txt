@@ -12,6 +12,8 @@ motion=on
 invert_x=off
 invert_y=off
 sensitivity=100
+# Seconds between two pictures when several are listed (0: change at each camera opening)
+cycle=0
 log=off
 
 # ---- WipEout 2048: pilot picture at a multiplayer session start (small pictures only)
@@ -261,12 +263,14 @@ image=white.bmp
 *PCSD00001
 image=white.bmp
 
-# ---- Ciel nosurge / Ciel nosurge OFFLINE: the back camera scans an EAN barcode to create a Sharl
-# (make pictures of other product codes with tools/make_barcode.py and change the name here)
+# ---- Ciel nosurge / Ciel nosurge OFFLINE: the back camera scans an EAN barcode to create a
+# Sharl, a different one per code: four codes take turns every 10 seconds on the scan screen
 *PCSG00046
-back=barcode.bmp
+back=barcode-1.bmp,barcode-2.bmp,barcode-3.bmp,barcode-4.bmp
+cycle=10
 *PCSG00454
-back=barcode.bmp
+back=barcode-1.bmp,barcode-2.bmp,barcode-3.bmp,barcode-4.bmp
+cycle=10
 
 # ---- Pro Camera Vita (PlayStation Mobile camera app)
 *PCM300001
