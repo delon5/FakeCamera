@@ -261,6 +261,13 @@ image=white.bmp
 *PCSD00001
 image=white.bmp
 
+# ---- Ciel nosurge / Ciel nosurge OFFLINE: the back camera scans an EAN barcode to create a Sharl
+# (make pictures of other product codes with tools/make_barcode.py and change the name here)
+*PCSG00046
+back=barcode.bmp
+*PCSG00454
+back=barcode.bmp
+
 # ---- Pro Camera Vita (PlayStation Mobile camera app)
 *PCM300001
 image=pattern.bmp

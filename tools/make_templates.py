@@ -3,8 +3,8 @@
 
 Every picture is drawn from scratch (no copyrighted artwork): a synthetic
 face for face detection, a colourful pattern, coloured objects, a room
-panorama, an outdoor backdrop, AR Play markers, a QR code, a small avatar and
-a white frame. Run it from the repository root:
+panorama, an outdoor backdrop, AR Play markers, a QR code, a small avatar, a
+white frame and an EAN-13 barcode. Run it from the repository root:
 
   python3 tools/make_templates.py
 
@@ -13,8 +13,12 @@ Needs Pillow (pip install pillow) and, for the QR code, qrcode (pip install qrco
 import math
 import os
 import random
+import sys
 
-from PIL import Image, ImageDraw, ImageFilter, ImageFont
+from PIL import Image, ImageDraw, ImageFont
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from make_barcode import draw_barcode  # noqa: E402
 
 OUT = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "templates")
 
@@ -327,6 +331,7 @@ def main():
     save(make_qr(), "qr.bmp")
     save(make_avatar(), "avatar.bmp")
     save(make_white(), "white.bmp")
+    save(draw_barcode("4901234567894"), "barcode.bmp")   # EAN-13 with a Japanese (JAN) prefix
 
 
 if __name__ == "__main__":
